@@ -347,6 +347,19 @@ class Engine:
         d = os.path.realpath(d)
         return d == self.rroot or d.startswith(self.rroot + os.sep)
 
+    def writable(self, key, path, link=False):
+        """Checked right before writing, not when planning: a link received earlier in this same run
+        may already stand in the path. The file itself must not be a link either — it would be
+        written through."""
+        if not self.inside(path):
+            log(f"{key}: " + tx("its folder here is a link out of the projects folder — not written",
+                               "его папка здесь — ссылка за пределы папки проектов — не записываю"))
+            return False
+        if not link and os.path.islink(path):
+            log(f"{key}: " + tx("a link here instead of the file — left alone", "на месте файла здесь ссылка — не трогаю"))
+            return False
+        return True
+
     # ---- file lists ---------------------------------------------------------------------------
     @staticmethod
     def drop_leftover(p):
@@ -793,10 +806,12 @@ class Engine:
 
     def apply_log(self, key, rf, a, how, extra, delta):
         path = self.path_of(key)
+        if not self.writable(key, path):
+            return False
         L, base = rf.L, [rf.base[0], rf.base[1]]
         when = self.remote_when(rf)
         if how == "append":
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
             try:
                 if os.fstat(fd).st_size != a:
                     log(f"{key}: " + tx("changed during the sync — will receive next time", "файл изменился во время синхронизации — получу в следующий раз"))
@@ -852,6 +867,8 @@ class Engine:
 
     def apply_whole(self, key, kind, rf, how, delta):
         path = self.path_of(key)
+        if not self.writable(key, path, link=kind == "link"):
+            return False
         if kind == "link":
             with open(delta, "rb") as f:
                 target = os.fsdecode(f.read())

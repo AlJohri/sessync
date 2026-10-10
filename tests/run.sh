@@ -394,6 +394,14 @@ check "файл под ссылкой: синхронизация проходи
 check "через ссылку ничего не записано" test ! -e "$T/outside/evil.txt"
 check "в журнале названа причина" grep -q 'ссылка за пределы папки проектов' "$(stf Z sync.log)"
 check "обычная сессия рядом пришла" test -f "$T/Z/projects/-tmp-p8/y1.jsonl"
+mac Z2; setconf Z2 bucket8   # новый Mac: ссылка и файл под ней приходят за одну синхронизацию
+check "ссылка и файл под ней за один раз: синхронизация проходит" run Z2 now
+check "за один раз: через ссылку тоже ничего не записано" test ! -e "$T/outside/evil.txt"
+ln -s "$T/outside/target.txt" "$T/Z2/projects/-tmp-p8/y2.jsonl"   # на месте будущего файла — ссылка
+say Y -tmp-p8 y2 "сессия, которую не надо писать через ссылку"
+run Y now >/dev/null
+check "файл на месте ссылки: синхронизация проходит" run Z2 now
+check "файл на месте ссылки: через неё ничего не записано" test ! -e "$T/outside/target.txt"
 
 echo "== English"
 en() { SESSYNC_LANG=en ss "$@"; }
