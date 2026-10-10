@@ -283,7 +283,7 @@ PY
   log "$(t "cleanupPeriodDays was $was — set to $RETENTION; what Claude Code deleted comes back from the storage" \
     "cleanupPeriodDays был $was — поставлен $RETENTION; удалённое Claude Code вернётся из архива")"
   notify "$(t "Session retention was $was days — set to 100 years, deleted sessions come back" \
-    "Срок хранения сессий был $was дн. — поставлено 100 лет, удалённое вернётся из архива")"
+    "Срок хранения сессий был $was дн., теперь 100 лет; удалённые сессии вернутся из хранилища")"
 }
 
 # Name of this Mac's history file in the storage. Two Macs can have the same name (same model,
@@ -479,7 +479,7 @@ sync_locked() {
   # resync — delete nothing, bring back what is missing (retention fixed, deletes --undo);
   # apply — delete even if there are many deletions (deletes --apply)
   local kind="" mode=normal res rc map=()
-  [ -f "$st/engine/projects.json" ] || kind=$(t "first sync" "первичная синхронизация")
+  [ -f "$st/engine/projects.json" ] || kind=$(t "first sync" "первая синхронизация")
   [ -n "$FORCE_RESYNC" ] && { mode=resync; kind=${kind:-$RESYNC_KIND}; }
   [ -n "$APPLY_DELETES" ] && mode=apply
   # Another user name here: project folders are renamed between the storage's home and this one
@@ -590,7 +590,7 @@ hooks() {
       and ([.hooks[]?[]?.hooks[]?.command // empty] | map(select(test("cc-sync hook"))) | length == 0)
       and ((.cleanupPeriodDays // 30) >= 3650)' "$settings") \
       || { say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
-    if [ "$ok" = true ]; then say "-- hooks already in place" "-- hook'и уже на месте"; return 0; fi
+    if [ "$ok" = true ]; then say "-- hooks already in place" "-- хуки уже на месте"; return 0; fi
   fi
   backup="$settings.bak-sessync-$(date +%Y%m%d-%H%M%S)"
   cp "$settings" "$backup"
@@ -610,8 +610,8 @@ hooks() {
   ' "$backup" > "$tmp" || { rm -f "$tmp"; say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
   # cat, not mv: the file keeps its permissions, and a symlinked settings.json stays a symlink
   cat "$tmp" > "$settings"; rm -f "$tmp"
-  if [ -n "$hs" ]; then say "-- hooks added; previous file: ${backup/#$HOME/~}" "-- hook'и добавлены; прежний файл: ${backup/#$HOME/~}"
-  else say "-- hooks removed; previous file: ${backup/#$HOME/~}" "-- hook'и убраны; прежний файл: ${backup/#$HOME/~}"; fi
+  if [ -n "$hs" ]; then say "-- hooks added; previous file: ${backup/#$HOME/~}" "-- хуки добавлены; прежний файл: ${backup/#$HOME/~}"
+  else say "-- hooks removed; previous file: ${backup/#$HOME/~}" "-- хуки убраны; прежний файл: ${backup/#$HOME/~}"; fi
 }
 
 usage() {
@@ -625,10 +625,10 @@ sessync — сессии Claude Code на всех ваших Mac, через в
   sessync conflicts    копии сессий, менявшихся на двух Mac между синхронизациями (--delete)
   sessync trash        удалённые сессии в корзине хранилища (хранятся 30 дн., TRASH_DAYS)
   sessync restore ID   вернуть сессию из корзины (id или часть пути)
-  sessync deletes      синхронизация остановлена из-за массового удаления: --undo / --apply
+  sessync deletes      если синхронизация остановилась из-за массового удаления: --undo / --apply
   sessync setup        хранилище, ключи и пароль шифрования (в своём терминале)
   sessync export       по шагам сохранить ключи и пароль в «Пароли» — для других Mac
-  sessync hooks install | remove   hook'и Claude Code в ~/.claude/settings.json
+  sessync hooks install | remove   хуки Claude Code в ~/.claude/settings.json
   sessync statusline   короткое состояние для строки статуса Claude Code
   sessync log [N]      последние строки журнала
   sessync version
@@ -658,8 +658,8 @@ EOF
 setup_storage() {
   local c v
   say "Where to keep the sessions? Everything is encrypted on this Mac before it leaves." \
-    "Где хранить сессии? Всё шифруется на этом Mac, до отправки."
-  say "  1) Cloudflare R2 — 10 GB free, no download fees (recommended)" "  1) Cloudflare R2 — 10 ГБ бесплатно, скачивание бесплатно (советую)"
+    "Где хранить сессии? Всё шифруется на этом Mac до отправки."
+  say "  1) Cloudflare R2 — 10 GB free, no download fees (recommended)" "  1) Cloudflare R2 — 10 ГБ бесплатно, скачивание бесплатно (рекомендую)"
   say "  2) Backblaze B2 — 10 GB free" "  2) Backblaze B2 — 10 ГБ бесплатно"
   say "  3) Amazon S3" "  3) Amazon S3"
   say "  4) Other S3-compatible storage (by its endpoint)" "  4) Другое S3-совместимое хранилище (по адресу endpoint)"
@@ -737,15 +737,15 @@ case "${1:-now}" in
     else say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; fi
     if [ -f "$st/off" ]; then say "Automatic sync: OFF (turn on: sessync on)" "Автосинхронизация: ВЫКЛЮЧЕНА (включить: sessync on)"
     else say "Automatic sync: on — session start and end, every $((INTERVAL / 60)) min while claude is open" \
-      "Автосинхронизация: включена — старт и конец сессии, раз в $((INTERVAL / 60)) мин пока открыт claude"; fi
+      "Автосинхронизация: включена — при запуске и закрытии сессии и раз в $((INTERVAL / 60)) мин, пока открыт claude"; fi
     if loop_alive; then say "Background loop: running (pid $(cat "$st/loop.pid")), ends with the last session" \
-      "Фоновый цикл: работает (pid $(cat "$st/loop.pid")), закончится сам с последней сессией"
+      "Фоновый цикл: работает (pid $(cat "$st/loop.pid")), остановится сам, когда закроется последняя сессия"
     else say "Background loop: not running" "Фоновый цикл: не запущен"; fi
     if [ -f "$st/last" ]; then
       IFS=$'\t' read -r when epoch up down secs kind < "$st/last"
       say "Last successful: $when — sent $up, received $down, $secs s${kind:+ ($kind)}" \
-        "Последняя удачная: $when — отправлено $up, получено $down, ${secs} с${kind:+ ($kind)}"
-    else say "Last successful: none yet" "Последняя удачная: ещё не было"; fi
+        "Последняя успешная: $when — отправлено $up, получено $down, ${secs} с${kind:+ ($kind)}"
+    else say "Last successful: none yet" "Последняя успешная: ещё не было"; fi
     [ -f "$st/error" ] && echo "$(t Error Ошибка): $(cat "$st/error")"
     [ -f "$st/conflicts" ] && echo "$(t Conflicts Конфликтов): $(cat "$st/conflicts") — sessync conflicts"
     retention_ok || say "Session retention (cleanupPeriodDays) is under 10 years — the next sync fixes it (sessync)" \
@@ -938,7 +938,7 @@ print(("  из них дописанные части сессий (хвосты
       say "Done: the storage is reachable, the password matches." "Готово: доступ к хранилищу есть, пароль совпадает."
       if ! jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("sessync hook"))' "$cfg/settings.json" >/dev/null 2>&1; then
         read -rp "$(t "Add sessync hooks to ~/.claude/settings.json (sync at session start and end)? [Y/n] " \
-          "Добавить hook'и sessync в ~/.claude/settings.json (синхронизация на старте и в конце сессии)? [Y/n] ")" v
+          "Добавить хуки sessync в ~/.claude/settings.json (синхронизация при запуске и закрытии сессии)? [Y/n] ")" v
         case $v in [nNнН]*) ;; *) hooks install ;; esac
       fi
       say "First sync: sessync" "Первая синхронизация: sessync"
@@ -959,8 +959,8 @@ print(("  из них дописанные части сессий (хвосты
 Сохраним пароль шифрования (и ключи хранилища) в приложение «Пароли»: на другом Mac их нужно будет
 вставить в sessync setup, а запись из «Паролей» сама появится там через iCloud.
 
-Значения по одному кладутся в буфер обмена только этого Mac (без «Универсального буфера»,
-мимо истории буфера) и на экран не выводятся.
+Значения по одному кладутся в буфер обмена только этого Mac (без «Универсального буфера
+обмена», мимо менеджеров истории буфера) и на экран не выводятся.
 Enter нажимайте здесь, в Терминале, а не в «Паролях».
 
 EOF

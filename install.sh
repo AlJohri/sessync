@@ -36,7 +36,7 @@ case ":$PATH:" in
        "!! $bin нет в PATH — добавьте в ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-say "== 3/3 Claude Code hooks and session retention" "== 3/3 Hook'и Claude Code и срок хранения сессий"
+say "== 3/3 Claude Code hooks and session retention" "== 3/3 Хуки Claude Code и срок хранения сессий"
 SESSYNC_BIN="$bin/sessync" "$here/bin/sessync" hooks install
 
 echo

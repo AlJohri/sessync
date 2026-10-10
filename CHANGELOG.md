@@ -14,7 +14,6 @@
 The tool is now **sessync** and is ready for other people's Macs.
 
 - Homebrew: `brew install latark/tap/sessync`.
-
 - One command: `sessync` (sync), `sessync find` (was `cc-find`), `sessync status`, … `install.sh`
   replaces the old `cc-sync`/`cc-find` links and hooks.
 - English interface; Russian when the system language is Russian (`LANGUAGE=` in the config).
