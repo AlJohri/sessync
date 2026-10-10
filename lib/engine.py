@@ -23,10 +23,23 @@ be read from any position). Compaction is done by the Mac that appended last:
     they are folded into one level-1 tail (only their volume travels, not the whole session).
 So an abandoned session is folded once and costs nothing after that.
 
-Changes on both sides since the last sync are a conflict: the longer version stays under the main
-name, the other is saved next to it as <file>.conflictN. What is deleted on this Mac is first
-copied to the trash (inside the storage), then deleted. More than --max-delete percent of deletions
-stop the sync until the user decides (like bisync --max-delete, with the same log line).
+Changes on both sides since the last sync are a conflict. A session (<project>/<uuid>.jsonl) went
+two ways: the common start stays, and of the two continuations one keeps the name — the one with
+the conversation, then the one already decided on earlier, then the longer one — while the other
+becomes a separate session, the way Claude Code's own /branch makes one: the same lines with the
+new session id, and a "<title> (Branch)" title. Its id comes from the session id and the first line
+where the versions part, so every Mac that meets the same split makes the same branch, and a Mac
+whose branch is already a separate session gives way and appends to it. A continuation of only
+Claude Code's service lines (a session opened and closed, /exit) is not worth a branch and goes.
+Other files keep the longer version under the name and the other next to it as <file>.conflictN.
+
+The file of a session open in claude on this Mac (--sessions, --open) is not changed: Claude Code
+has it in memory and would go on from what it read. What came from another Mac waits until the
+session closes (--held-out names such sessions); this Mac's own lines go out as usual.
+
+What is deleted on this Mac is first copied to the trash (inside the storage), then deleted. More
+than --max-delete percent of deletions stop the sync until the user decides (like bisync
+--max-delete, with the same log line).
 
 --map=REMOTE:LOCAL: on a Mac with another user name, project folders (the first path component,
 named after the absolute path by Claude Code) under the storage's home prefix REMOTE are LOCAL here.
@@ -49,6 +62,8 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
+import uuid
 from datetime import datetime, timedelta, timezone
 
 W = 4096                                             # signature window: the last 4 KB before a point
@@ -58,6 +73,9 @@ STALE = 600                                          # an unfinished line older 
 RU = os.environ.get("SESSYNC_LANG") == "ru"
 LINK = ".rclonelink"
 SEG_RE = re.compile(r"^(\d{16})-(\d{16})-([01])-([0-9a-f]{12})-(.+)$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+FORK_NS = uuid.UUID("5e55c0de-b4a7-4c1e-9d2f-0f0f5e55c0de")   # branch ids: uuid5 in this namespace
+SERVICE = ("<command-name>", "<command-message>", "<command-args>", "<local-command-")
 LOG = None
 
 
@@ -240,6 +258,125 @@ def open_sessions(d):
     return ids
 
 
+def fork_ok(key):
+    """A session's own file, <project>/<uuid>.jsonl: its other continuation can be a session of its own."""
+    parts = key.split("/")
+    return len(parts) == 2 and parts[1].endswith(".jsonl") and bool(UUID_RE.match(parts[1][:-6]))
+
+
+def fork_id(sid, line):
+    """The id of the branch that starts with this line: the same on every Mac."""
+    return str(uuid.uuid5(FORK_NS, sid + ":" + sha(line)))
+
+
+def iter_lines(parts, a, b):
+    """The lines of bytes [a, b) of a file made of parts [(path, start, end), …] put one after another.
+    The parts, a and b end lines."""
+    pos = 0
+    for path, s, e in parts:
+        lo, hi = max(a, pos), min(b, pos + e - s)
+        if lo < hi:
+            with open(path, "rb") as f:
+                f.seek(s + lo - pos)
+                left = hi - lo
+                while left > 0:
+                    line = f.readline(left)
+                    if not line:
+                        raise Fail(tx("the file got shorter during the sync: ", "файл стал короче во время синхронизации: ") + path)
+                    left -= len(line)
+                    yield line
+        pos += e - s
+
+
+def common_lines(f1, a1, n1, f2, a2, n2):
+    """How many bytes, in whole lines, two ranges of files share from their start."""
+    done, last, n = 0, 0, min(n1, n2)
+    with open(f1, "rb") as x, open(f2, "rb") as y:
+        x.seek(a1)
+        y.seek(a2)
+        while done < n:
+            k = min(1 << 20, n - done)
+            bx, by = x.read(k), y.read(k)
+            if bx != by:
+                lo, hi = 0, min(len(bx), len(by))
+                while lo < hi:  # the first byte that differs
+                    mid = (lo + hi) // 2
+                    if bx[:mid + 1] == by[:mid + 1]:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                i = bx.rfind(b"\n", 0, lo)
+                return done + i + 1 if i >= 0 else last
+            i = bx.rfind(b"\n")
+            if i >= 0:
+                last = done + i + 1
+            done += k
+    return last
+
+
+def conversation(line):
+    """True — a line of the conversation itself; False — Claude Code's bookkeeping (titles, modes,
+    /exit and other commands); None — not a JSON line."""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    t = d.get("type")
+    if t == "assistant":
+        return True
+    if t != "user" or d.get("isMeta") or not isinstance(d.get("message"), dict):
+        return False
+    c = d["message"].get("content")
+    if isinstance(c, str):
+        return not c.lstrip().startswith(SERVICE)
+    return bool(c)
+
+
+def talk(parts, a, b):
+    """Bytes [a, b): True — hold conversation, False — only bookkeeping, None — damaged."""
+    found = False
+    for line in iter_lines(parts, a, b):
+        k = conversation(line)
+        if k is None:
+            return None
+        found = found or k
+    return found
+
+
+def clean(s):
+    """Without control and format characters (ESC, newlines, bidi): the text reaches a terminal."""
+    return "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf"))
+
+
+def title_of(parts, end, sid):
+    """The session's title, for its branch: the name given to it, else Claude Code's title, else the
+    first prompt. Only from the lines, so every Mac gets the same."""
+    custom = ai = first = None
+    for line in iter_lines(parts, 0, end):
+        if b'"custom-title"' not in line and b'"ai-title"' not in line \
+                and (first is not None or b'"type":"user"' not in line):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("sessionId", sid) != sid:
+            continue
+        t = d.get("type")
+        if t == "custom-title" and isinstance(d.get("customTitle"), str):
+            custom = d["customTitle"]
+        elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
+            ai = d["aiTitle"]
+        elif t == "user" and first is None and conversation(line):
+            c = d["message"]["content"]
+            if isinstance(c, list):
+                c = next((x.get("text") for x in c if isinstance(x, dict) and x.get("type") == "text"), None)
+            first = c if isinstance(c, str) else None
+    return clean(" ".join((custom or ai or first or "").split()))[:80].strip() or "Session"
+
+
 class Seg:
     __slots__ = ("name", "off", "end", "lvl", "h", "host", "mtime")
 
@@ -319,6 +456,8 @@ class Engine:
         self.nparts = 0
         self.gets, self.puts, self.conflicts = [], [], []
         self.del_remote, self.del_local, self.insync = [], [], set()
+        self.rem, self.opened = {}, set()
+        self.held, self.forks = {}, []   # open sessions waiting for another Mac's lines; new branches
 
     def save(self):
         tmp = self.a.state + ".sessync.tmp"
@@ -545,6 +684,29 @@ class Engine:
     def get(self, key, rf, a, how, extra=None):
         self.gets.append((key, rf, a, how, extra))
 
+    def incoming(self, key, rf, a):
+        """Lines from another Mac for this file — unless its session is open here."""
+        if session_of(key) in self.opened:
+            self.hold(key, rf, a)
+        else:
+            self.get(key, rf, a, "append")
+
+    def hold(self, key, rf, have):
+        """The session is open in claude here: Claude Code has it in memory and would go on from what
+        it read, so its file isn't changed now; what came from another Mac is applied after it closes."""
+        sid = session_of(key)
+        if sid not in self.held:
+            hosts = [s.host for s in (rf.chain if rf else []) if s.end > have and s.host != self.host]
+            self.held[sid] = re.sub(r"-[0-9A-Fa-f]{8}$", "", hosts[-1]) if hosts else ""
+            log(f"{key}: " + tx("open here — what came from another Mac waits until the session closes",
+                               "открыта здесь — пришедшее с другого Mac применю, когда сессия закроется"))
+        return False
+
+    def known(self, key, fid):
+        """A branch with this id exists already — in the storage or here."""
+        fkey = f"{key.split('/')[0]}/{fid}.jsonl"
+        return fkey in self.rem or os.path.lexists(self.path_of(fkey))
+
     # ---- decisions per file -------------------------------------------------------------------
     def plan_log(self, key, st, l, rf, opened):
         mode, deletes = self.a.mode, not self.a.no_deletes
@@ -595,7 +757,7 @@ class Engine:
                 self.puts.append(self.tail_put(key, path, rf, s, Ll, l))
             elif dl == 0:
                 if l.size == s:
-                    self.get(key, rf, s, "append")
+                    self.incoming(key, rf, s)
                 elif time.time() - l.mtime / 1e9 < STALE:
                     log(f"{key}: " + tx("a line is being written right now — will receive next time", "строка дописывается прямо сейчас — получу в следующий раз"))
                 else:  # a cut-off line has been hanging for long — a change here too: conflict
@@ -608,7 +770,7 @@ class Engine:
                     if Ll > c:
                         self.puts.append(self.tail_put(key, path, rf, c, Ll, l))
                     elif rf.L > c and l.size == c:
-                        self.get(key, rf, c, "append")
+                        self.incoming(key, rf, c)
                 else:
                     self.conflicts.append((key, path, l, rf, s))
         elif not lv and rv and rf.L == s and complete_end(path, l.size, 0) > rf.L:
@@ -685,9 +847,13 @@ class Engine:
         shutil.rmtree(self.work, ignore_errors=True)
         os.makedirs(self.work)
         self.flush_pending()
+        if self.a.wait_closed:  # from the hook of a session that is closing: claude exits right after it
+            t0 = time.time()
+            while self.a.wait_closed in open_sessions(self.a.sessions) and time.time() - t0 < 30:
+                time.sleep(0.5)
         loc = self.local_files()
-        rem = self.remote()
-        opened = open_sessions(self.a.sessions)
+        rem = self.rem = self.remote()
+        opened = self.opened = open_sessions(self.a.sessions) | set(self.a.open)
         known = len(self.files)
 
         for key in sorted(set(loc) | set(rem) | set(self.files)):
@@ -713,12 +879,17 @@ class Engine:
                         with open(self.a.deleted_out, "a", encoding="utf-8") as f:
                             f.write("".join(k + "\n" for k in keys))
                     self.save()
+                    self.outputs()
                     return 3
 
         for key, path, l, rf, p in self.conflicts:
             Ll = complete_end(path, l.size, 0)
-            if Ll > rf.L:
+            if fork_ok(key):  # decided once both versions are here
+                self.get(key, rf, p, "conflict", (Ll, l))
+            elif Ll > rf.L:
                 self.get(key, rf, p, "conflict-local", (Ll, l))
+            elif session_of(key) in opened:
+                self.hold(key, rf, Ll)
             else:
                 self.get(key, rf, p, "conflict-remote")
 
@@ -733,8 +904,17 @@ class Engine:
                     self.pending.append(["s", f"{key}/{s.name}"])
         self.save()
         self.flush_pending()
+        self.outputs()
         print(self.up, self.down, self.bup, self.bdown)
         return 0
+
+    def outputs(self):
+        """For sessync: open sessions that wait for another Mac's lines (id, that Mac), new branches
+        (id, title)."""
+        for path, rows in ((self.a.held_out, self.held.items()), (self.a.forks_out, self.forks)):
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("".join(f"{x}\t{y}\n" for x, y in rows))
 
     def do_gets(self):
         if not self.gets:
@@ -800,6 +980,121 @@ class Engine:
             n += 1
         return f"{path}.conflict{n}"
 
+    def resolve(self, key, path, rf, a, extra, delta):
+        """A session went two ways (see the module docstring). Both versions are here: this Mac's
+        file up to Ll, and the storage's — the same first a bytes, then delta. False — left for later."""
+        Ll, l = extra
+        L, sid = rf.L, session_of(key)
+        here, there = [(path, 0, Ll)], [(path, 0, a), (delta, 0, L - a)]
+        c = a + common_lines(path, a, Ll - a, delta, 0, L - a)
+        mine, theirs = c < Ll, c < L
+        if not mine and not theirs:  # the same lines: nothing to decide
+            self.files[key] = self.logstate(L, file_sig(path, L), -1, -1, [rf.base[0], rf.base[1]])
+            return False
+        win, fid, drop = mine, None, False   # win — this Mac's version keeps the name
+        if mine and theirs:
+            km, kt = talk(here, c, Ll), talk(there, c, L)
+            if km is None or kt is None:  # not lines of JSON — damage: the longer one, a copy of the other
+                if Ll <= L and sid in self.opened:
+                    return self.hold(key, rf, Ll)
+                return self.apply_log(key, rf, a, "conflict-local" if Ll > L else "conflict-remote", extra, delta)
+            if km != kt:
+                win, drop = km, True   # the conversation wins over bookkeeping, which goes
+            elif not km:
+                win, drop = Ll > L, True
+            else:
+                fl = fork_id(sid, next(iter_lines(here, c, Ll)))
+                fr = fork_id(sid, next(iter_lines(there, c, L)))
+                kl, kr = self.known(key, fl), self.known(key, fr)
+                win = kr if kl != kr else Ll > L   # a branch made a session already gives way
+                fid = fr if win else fl
+        if (not win and sid in self.opened) or (fid and fid in self.opened):
+            return self.hold(key, rf, Ll)
+        if fid:
+            loser, end = (there, L) if win else (here, Ll)
+            if not self.make_fork(key, loser, c, end, fid):
+                copy = self.conflict_name(path)
+                self.copy_version(loser, end, copy)
+                log(f"{key}: " + tx("went two ways; the other version saved as ", "разошлась на две версии; другая сохранена как ") + os.path.basename(copy))
+        elif drop:
+            log(f"{key}: " + tx("the other version differed only in Claude Code's service lines — they go",
+                               "другая версия отличалась только служебными строками Claude Code — они убраны"))
+        if win:
+            st = self.files.get(key)
+            if st is not None and a == st["s"] and a >= rf.base[0] and rf.boundary(a):
+                self.puts.append((key, path, ("seg", a, Ll, 0), l, self.chain_drop(key, rf, a)))
+            else:
+                self.puts.append((key, path, ("base", 0, Ll), l, self.chain_drop(key, rf)))
+        else:
+            tmp = path + ".sessync.tmp"
+            clone_prefix(path, tmp, a)
+            append_file(tmp, delta)
+            os.replace(tmp, path)
+            when = self.remote_when(rf)
+            if when:
+                os.utime(path, (time.time(), when))
+            self.files[key] = self.logstate(L, file_sig(path, L), L, os.stat(path).st_mtime_ns,
+                                            [rf.base[0], rf.base[1]])
+        return True
+
+    def make_fork(self, key, parts, c, end, fid):
+        """The other continuation as a session of its own, as Claude Code's /branch makes one: the
+        same lines with the branch's session id, and its title right after the common start — so a
+        Mac that has more of the same branch only appends to it. False — the branch here went on
+        differently, or it can't be written."""
+        sid = session_of(key)
+        fkey = f"{key.split('/')[0]}/{fid}.jsonl"
+        fpath = self.path_of(fkey)
+        if not self.writable(fkey, fpath):
+            return False
+        title = title_of(parts, c, sid)
+        old, new = f'"sessionId":"{sid}"'.encode(), f'"sessionId":"{fid}"'.encode()
+        mark = json.dumps({"type": "custom-title", "customTitle": f"{title} (Branch)", "sessionId": fid},
+                          ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        tmp = os.path.join(self.work, "fork", fid + ".jsonl")
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        with open(tmp, "wb") as out:
+            for line in iter_lines(parts, 0, c):
+                out.write(line.replace(old, new))
+            out.write(mark)
+            for line in iter_lines(parts, c, end):
+                out.write(line.replace(old, new))
+        n = os.path.getsize(tmp)
+        if not os.path.lexists(fpath):
+            place_new(tmp, fpath)
+            if fkey not in self.rem:  # new everywhere: it goes out in this same run
+                self.puts.append((fkey, fpath, ("base", 0, n), Local("log", fpath, n, os.stat(fpath).st_mtime_ns), []))
+        else:
+            have = os.path.getsize(fpath)
+            if os.path.islink(fpath) or common_lines(fpath, 0, have, tmp, 0, n) != min(have, n):
+                return False
+            if have < n:  # more of the same branch here
+                fd = os.open(fpath, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                try:
+                    if os.fstat(fd).st_size != have:
+                        return False
+                    with open(tmp, "rb") as f:
+                        f.seek(have)
+                        while True:
+                            chunk = f.read(1 << 20)
+                            if not chunk:
+                                break
+                            os.write(fd, chunk)
+                finally:
+                    os.close(fd)
+        self.forks.append((fid, title))
+        log(f"{key}: " + tx("went two ways on two Macs — the other branch is the session ",
+                           "разошлась на двух Mac — другая ветка теперь сессия ") + fid)
+        return True
+
+    @staticmethod
+    def copy_version(parts, end, dst):
+        tmp = dst + ".sessync.tmp"
+        with open(tmp, "wb") as out:
+            for line in iter_lines(parts, 0, end):
+                out.write(line)
+        os.rename(tmp, dst)
+
     @staticmethod
     def remote_when(rf):
         return max([mtime_of(rf.base[1]) or 0] + [mtime_of(s.mtime) or 0 for s in rf.chain]) or None
@@ -808,6 +1103,8 @@ class Engine:
         path = self.path_of(key)
         if not self.writable(key, path):
             return False
+        if how == "conflict":
+            return self.resolve(key, path, rf, a, extra, delta)
         L, base = rf.L, [rf.base[0], rf.base[1]]
         when = self.remote_when(rf)
         if how == "append":
@@ -1034,6 +1331,10 @@ def main():
     s.add_argument("--max-delete", type=int, default=50)
     s.add_argument("--map", metavar="REMOTE:LOCAL")  # with "=": the names start with "-"
     s.add_argument("--deleted-out")
+    s.add_argument("--open", action="append", default=[], metavar="SESSION")  # open, even if not registered yet
+    s.add_argument("--wait-closed", metavar="SESSION")   # wait (30 s at most) until it is closed
+    s.add_argument("--held-out")
+    s.add_argument("--forks-out")
     s.add_argument("--log")
     f = sub.add_parser("fetch")
     for name in ("base", "segdir", "out"):

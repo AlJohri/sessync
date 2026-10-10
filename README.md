@@ -25,10 +25,13 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 - **Only new lines travel.** A session file is only ever appended to, so sessync ships it the way
   [Litestream](https://litestream.io/how-it-works/) ships a database log. If you're working in a
   session of hundreds of megabytes, each sync sends kilobytes, not the whole file.
-- **Nothing gets lost.** If a session was appended to on two Macs between syncs, the longer version
-  keeps its name and the other is saved next to it as a copy. A truncated or damaged session file
-  never replaces a full one. Deleted sessions stay in the trash for 30 days. If more than half of
-  the files are about to be deleted at once, sync stops and waits for you to decide.
+- **Nothing gets lost.** A session continued on two Macs between syncs splits the way Claude Code's
+  own `/branch` does: one branch keeps the session, the other becomes a session of its own,
+  "<title> (Branch)", and both are in `/resume`. A session open in `claude` is never changed under
+  it, and `claude -r` warns you when the copy it opened is older than on another Mac. A truncated or
+  damaged session file never replaces a full one. Deleted sessions stay in the trash for 30 days. If
+  more than half of the files are about to be deleted at once, sync stops and waits for you to
+  decide.
 - **Search.** `sessync find words` finds the sessions where something was discussed and prints the
   command to continue each one.
 - **Sessions no longer expire after 30 days.** sessync raises Claude Code's retention
@@ -45,7 +48,7 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 | What is sent | only appended lines | whole files, compressed | whole files, through git | whole files |
 | Sessions over 100 MB | yes | can't be downloaded back | via Git LFS | yes |
 | A truncated copy can overwrite the full one | no, it's a conflict | yes | — | yes |
-| A session appended to on two Macs | the longer one stays, the other is kept as a copy | `.conflict` copy | smart merge | conflict copies |
+| A session continued on two Macs | two sessions, like `/branch`; both in `/resume` | `.conflict` copy | merged into one file | conflict copies |
 | Prompt history | merged line by line | last writer wins | optional | conflict copies |
 | Deletions | 30-day trash, stop on mass deletion, open sessions left alone | deleted at once | mirrored with guards | deleted at once |
 | Encryption | contents and file names | contents | none (encrypt the repo yourself) | on the provider's side |
@@ -111,7 +114,8 @@ clears the clipboard at the end. The Passwords entry reaches your other devices 
 
 Usually there is nothing to do: it all happens by itself. To switch Macs, run `sessync` on the first
 one (or just close `claude`), then start `claude` on the second — the sessions from the first show
-up in `/resume`. Or find the one you need:
+up in `/resume`. If you forget, `claude -r` on the second Mac tells you when the copy it opened is
+older and how to get the latest one. Or find the session you need:
 
 ```bash
 sessync find lease contract     # sessions where the conversation has all these words
@@ -131,7 +135,7 @@ your messages and Claude's answers. Injected service text and tool output are se
 | `sessync status` | what was synced and when, errors, conflicts; with `--remote`, the size in the storage |
 | `sessync find …` | search all sessions |
 | `sessync off` / `on` | turn automatic sync off / on |
-| `sessync conflicts` | sessions appended to on two Macs; `--delete` deletes the copies |
+| `sessync conflicts` | sessions that went two ways on two Macs, and copies of other files; `--delete` deletes the copies |
 | `sessync trash` | deleted sessions in the storage trash |
 | `sessync restore <id>` | bring a session back from the trash |
 | `sessync deletes` | what was deleted when sync stopped on a mass deletion; `--undo` brings it back, `--apply` deletes everywhere |
@@ -157,10 +161,10 @@ What it shows:
 - `sessions ↻ 13:26` (dim) — all good, 13:26 is the time of the last sync. Yellow if there was no
   sync for over 30 minutes.
 - `sessions: <what happened>` (yellow) — an error.
-- `sessions: conflict N` (red) — N sessions were appended to on two Macs.
+- `sessions: conflict N` (red) — N copies of files that changed on two Macs (`sessync conflicts`).
 - `sessions: sync off` — automatic sync is off.
 
-Errors and new conflicts also show up once as a macOS notification.
+Errors, new copies and sessions that went two ways also show up once as a macOS notification.
 
 ## Tell Claude about it
 
@@ -227,7 +231,8 @@ in [SECURITY.md](SECURITY.md).
 - macOS only for now. Linux is next.
 - Sync is not instant: when a session starts and ends, and every 10 minutes. Run `sessync` before
   switching to another Mac.
-- Don't continue the same session on two Macs at the same time.
+- Continuing one session on two Macs at the same time splits it into two sessions. Nothing is lost,
+  but the conversation ends up in two places.
 - A deletion on one Mac reaches the others (and the trash keeps a copy for 30 days).
 - Only sessions and prompt history are synced. Settings, plugins, skills, `/rewind` checkpoints and
   `memory/` folders are not — keep those in a git repository of your `~/.claude`.
@@ -286,12 +291,24 @@ sessions deleted again.
   least twice the previous one, so over its lifetime a session uploads at most twice its size.
 - **Attachments** (tool output, images, conflict copies) are written once and travel whole. Symlinks
   (subagents) travel as links.
-- **Conflicts.** If a session was appended to on two Macs between syncs, the longer version keeps
-  the name and the other becomes `<id>.jsonl.conflict1` next to it. A session file that got shorter
-  is a conflict too.
+- **A session continued on two Macs** between syncs went two ways from some line on. The common
+  start stays; one continuation keeps the session — the one with the conversation, then the one
+  decided on before, then the longer one — and the other becomes a separate session, the way
+  `/branch` makes one: the same lines with a new session id and the title "<title> (Branch)". Its
+  id comes from the session and the line where the versions part, so every Mac makes the same
+  branch, and a Mac whose branch is already a separate session appends its later lines to it. A
+  continuation of only Claude Code's service lines (the session was opened and closed) is dropped.
+  Why not merge both into one file, as some tools do: Claude Code keeps branches in one file too
+  (after `/rewind`), but shows only one of them — the other could not be opened from `/resume` or
+  with `claude -r`. Other files that changed on two Macs keep the bigger version under the name and
+  the other as `<name>.conflict1` next to it; a session file that got shorter is a conflict too.
+- **Open sessions.** Claude Code reads a session's file when it opens it, and from then on only
+  appends to it. So sessync never changes the file of a session open in `claude` on this Mac (it
+  checks Claude Code's registry, `~/.claude/sessions/`): lines from another Mac wait until it
+  closes. On `claude -r`, the start hook syncs first (Claude's first answer waits for hooks anyway)
+  and warns if the session got lines on another Mac that this window doesn't have.
 - **Deletions.** What is deleted on this Mac is copied to the trash first. A session deleted on
-  another Mac but open here (sessync checks Claude Code's registry, `~/.claude/sessions/`) is deleted
-  here after it closes.
+  another Mac but open here is deleted here after it closes.
 - **Prompt history.** Each Mac has its own file in the storage (Mac name plus the start of its
   hardware UUID), only appended to; on each Mac all these files are merged line by line, without
   repeats.

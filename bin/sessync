@@ -8,7 +8,7 @@
 # When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
 # When the last claude closes, the background loop ends by itself.
 set -u
-VERSION=2.0.1
+VERSION=2.1.0
 # Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
 # like Claude Code's own transcripts
 umask 077
@@ -59,9 +59,10 @@ say() { t "$@"; echo; }
 TEST_REMOTE="${SESSYNC_TEST_REMOTE:-}"
 
 log() { mkdir -p "$st"; chmod 700 "$st"; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$logf"; }
-notify() {
+notify() {  # the text is an argument, not part of the script: it may hold a session's title
   [ -n "$TEST_REMOTE" ] && return 0
-  osascript -e "display notification \"$1\" with title \"sessync\"" >/dev/null 2>&1 || true
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "sessync"' -e 'end run' \
+    "$1" >/dev/null 2>&1 || true
 }
 
 secret() {
@@ -434,7 +435,17 @@ sync_once() {
   chmod 700 "$st"
   if [ -f "$st/off" ]; then say "Automatic sync is off: sessync on" "Автосинхронизация выключена: sessync on"; return 0; fi
   find "$st/lock" -maxdepth 0 -mmin +120 -exec rmdir {} \; 2>/dev/null
-  if ! mkdir "$st/lock" 2>/dev/null; then
+  local i got=""
+  mkdir "$st/lock" 2>/dev/null && got=1
+  if [ -z "$got" ] && [ -n "${SESSYNC_WAIT_LOCK:-}" ]; then
+    # By hand, or claude -r: the result is needed now — wait for the running sync (2 min at most)
+    [ -t 1 ] && say "Waiting for the running sync to finish…" "Жду, пока закончится текущая синхронизация…"
+    for i in $(seq 1 240); do
+      sleep 0.5
+      mkdir "$st/lock" 2>/dev/null && { got=1; break; }
+    done
+  fi
+  if [ -z "$got" ]; then
     # The running sync may have listed the files before this session wrote its last lines (a big
     # session uploads for minutes): let it run once more when done
     touch "$st/again"
@@ -488,18 +499,35 @@ sync_locked() {
   mkdir -p "$cfg/projects"
   : > "$st/run.log"
   : > "$st/deleted.txt"
-  local t0
+  : > "$st/held"
+  : > "$st/forks-run"
+  # SESSYNC_OPEN_SID — the session claude -r has just opened (it may not be registered yet);
+  # SESSYNC_CLOSING_SID — the one whose claude is exiting: wait for it, then its file is free
+  local t0 open=()
   t0=$(date +%s)
+  [ -n "${SESSYNC_OPEN_SID:-}" ] && open+=(--open "$SESSYNC_OPEN_SID")
+  [ -n "${SESSYNC_CLOSING_SID:-}" ] && open+=(--wait-closed "$SESSYNC_CLOSING_SID")
   res=$(engine sync projects "$cfg/projects" ss:projects ss:seg/projects "$st/engine/projects.json" \
     --host "$HOST" --work "$st/engine/work-projects" --mode "$mode" --skip-memory \
     --trash "ss:trash/$(today)" --sessions "$cfg/sessions" --deleted-out "$st/deleted.txt" \
+    --held-out "$st/held" --forks-out "$st/forks-run" ${open[@]+"${open[@]}"} \
     ${map[@]+"${map[@]}"} --log "$st/run.log" 2>>"$st/run.log"); rc=$?
   local up=0 down=0 bup=0 bdown=0 hist_ok=1
   [ $rc -eq 0 ] && read -r up down bup bdown <<<"$res"
   merge_history || hist_ok=""
   cat "$st/run.log" >> "$logf"
 
-  local n
+  # A session went two ways on two Macs: the other branch is a session of its own now
+  local n fid title
+  while IFS=$'\t' read -r fid title; do
+    [ -n "$fid" ] || continue
+    notify "$(t "«${title}» went two ways on two Macs. The other branch is a separate session: claude -r $fid" \
+      "«${title}» шла на двух Mac по-разному. Другая ветка — отдельная сессия: claude -r $fid")"
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$fid" "${title}" >> "$st/forks"
+  done < "$st/forks-run"
+  if [ -f "$st/forks" ] && [ "$(wc -l < "$st/forks")" -gt 50 ]; then
+    tail -n 50 "$st/forks" > "$st/forks.tmp" && mv -f "$st/forks.tmp" "$st/forks"
+  fi
   n=$(find "$cfg/projects" -name '*.conflict[0-9]*' -not -path '*/memory/*' 2>/dev/null | wc -l | tr -d ' ')
   if [ "$n" -gt 0 ]; then
     [ "$(head -1 "$st/conflicts" 2>/dev/null)" = "$n" ] \
@@ -532,6 +560,30 @@ sync_locked() {
 }
 
 kb() { echo "$(( ($1 + 1023) / 1024 )) $(t KB КБ)"; }
+
+# claude -r: Claude Code read the session's file before this hook ran, so lines written for it on
+# another Mac since this Mac's last sync are not on screen. Sync now — Claude's first answer waits
+# for this hook anyway (20 s at most, then the sync goes on in the background) — and if the session
+# has such lines, say so. sessync doesn't change the file of an open session: they are applied once
+# it closes, and going on here would split the conversation in two.
+resume_check() {
+  local sid=$1 pid i host msg ctx
+  SESSYNC_OPEN_SID=$sid SESSYNC_WAIT_LOCK=1 nohup "$self" _run >/dev/null 2>&1 &
+  pid=$!
+  for i in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -0 "$pid" 2>/dev/null && return 0
+  host=$(awk -F'\t' -v s="$sid" '$1 == s { print "+" $2; exit }' "$st/held" 2>/dev/null)
+  [ -n "$host" ] || return 0
+  host=${host#+}
+  msg=$(t "sessync: this session was continued on another Mac${host:+ ($host)}, and this window shows an older version. To open the latest one, exit (/exit) and run: sessync && claude -r $sid. If you go on here, the conversation splits in two, and one of the branches becomes a separate session." \
+    "sessync: эту сессию продолжили на другом Mac${host:+ ($host)}, а здесь открыта более старая версия. Чтобы открыть свежую, выйдите (/exit) и выполните: sessync && claude -r $sid. Если продолжить здесь, разговор разделится надвое, и одна из веток станет отдельной сессией.")
+  ctx="sessync: this copy of the session is older than its latest version on another Mac${host:+ ($host)}; what was written there after this copy is not in this conversation. The user was told to exit and reopen it with: sessync && claude -r $sid"
+  jq -nc --arg m "$msg" --arg c "$ctx" \
+    '{systemMessage: $m, hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $c}}'
+}
 
 loop_alive() {
   local pid
@@ -622,7 +674,7 @@ sessync — сессии Claude Code на всех ваших Mac, через в
   sessync status       что и когда синхронизировано, ошибки, конфликты (--remote — объём в хранилище)
   sessync find СЛОВА   найти сессии по переписке, в том числе с других Mac (sessync find -h)
   sessync off | on     выключить / включить автоматическую синхронизацию
-  sessync conflicts    копии сессий, менявшихся на двух Mac между синхронизациями (--delete)
+  sessync conflicts    сессии, которые на двух Mac пошли по-разному, и копии (--delete — удалить копии)
   sessync trash        удалённые сессии в корзине хранилища (хранятся 30 дн., TRASH_DAYS)
   sessync restore ID   вернуть сессию из корзины (id или часть пути)
   sessync deletes      если синхронизация остановилась из-за массового удаления: --undo / --apply
@@ -640,7 +692,7 @@ sessync — Claude Code sessions on all your Macs, through storage you own, encr
   sessync status       what was synced and when, errors, conflicts (--remote: size in the storage)
   sessync find WORDS   find sessions by what was said, including ones from other Macs (sessync find -h)
   sessync off | on     turn automatic sync off / on
-  sessync conflicts    copies of sessions changed on two Macs between syncs (--delete)
+  sessync conflicts    sessions that went two ways on two Macs, and copies (--delete deletes the copies)
   sessync trash        deleted sessions in the storage trash (kept 30 days, TRASH_DAYS)
   sessync restore ID   bring a session back from the trash (id or part of the path)
   sessync deletes      sync stopped because of a mass deletion: --undo / --apply
@@ -705,16 +757,30 @@ setup_storage() {
 
 case "${1:-now}" in
   now)
+    [ -t 1 ] && export SESSYNC_WAIT_LOCK=1   # by hand: wait for a running sync, then sync
     sync_all; rc=$?
     report $rc
     [ $rc -eq 75 ] && rc=0
     exit $rc ;;
 
-  hook)  # from Claude Code hooks: don't hold the session and print nothing
+  hook)  # from Claude Code hooks: don't hold the session; print nothing but the warning of resume_check
     [ -f "$st/off" ] && exit 0
-    nohup "$self" _run >/dev/null 2>&1 &
-    if [ "${2:-}" = start ] && ! loop_alive; then
+    sid="" src=""
+    if [ ! -t 0 ] && command -v jq >/dev/null; then   # the hook's input: {"session_id", "source", …}
+      input=$(head -c 65536)
+      sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+      src=$(printf '%s' "$input" | jq -r '.source // empty' 2>/dev/null)
+      case $sid in [A-Za-z0-9]*) ;; *) sid="" ;; esac   # an id, not an option
+      case $sid in *[!A-Za-z0-9-]*) sid="" ;; esac
+    fi
+    if [ "${2:-}" = start ] && [ -z "$TEST_REMOTE" ] && ! loop_alive; then
       nohup "$self" _loop >/dev/null 2>&1 &
+    fi
+    if [ "${2:-}" = start ] && [ "$src" = resume ] && [ -n "$sid" ]; then
+      resume_check "$sid"
+    else
+      [ "${2:-}" = end ] && export SESSYNC_CLOSING_SID=$sid
+      nohup "$self" _run >/dev/null 2>&1 &
     fi
     exit 0 ;;
 
@@ -748,6 +814,11 @@ case "${1:-now}" in
     else say "Last successful: none yet" "Последняя успешная: ещё не было"; fi
     [ -f "$st/error" ] && echo "$(t Error Ошибка): $(cat "$st/error")"
     [ -f "$st/conflicts" ] && echo "$(t Conflicts Конфликтов): $(cat "$st/conflicts") — sessync conflicts"
+    if [ -s "$st/forks" ]; then
+      IFS=$'\t' read -r when fid title < <(tail -n 1 "$st/forks")
+      say "Last session that went two ways: ${when:0:16} «${title}» — sessync conflicts" \
+        "Последняя разошедшаяся сессия: ${when:0:16} «${title}» — sessync conflicts"
+    fi
     retention_ok || say "Session retention (cleanupPeriodDays) is under 10 years — the next sync fixes it (sessync)" \
       "Срок хранения сессий (cleanupPeriodDays) меньше 10 лет — исправит ближайшая синхронизация (sessync)"
     if [ "$(enc "$(canon_home)")" != "$(enc "$HOME")" ]; then
@@ -789,21 +860,34 @@ print(("  из них дописанные части сессий (хвосты
 
   conflicts)
     files=$(find "$cfg/projects" -name '*.conflict[0-9]*' -not -path '*/memory/*' 2>/dev/null)
-    if [ -z "$files" ]; then say "No conflicts" "Конфликтов нет"; rm -f "$st/conflicts"; exit 0; fi
+    forks=$(tail -n 20 "$st/forks" 2>/dev/null)
     if [ "${2:-}" = --delete ]; then
-      printf '%s\n' "$files" | while IFS= read -r f; do rm -f -- "$f"; done
+      [ -n "$files" ] && printf '%s\n' "$files" | while IFS= read -r f; do rm -f -- "$f"; done
       rm -f "$st/conflicts"
       say "Copies deleted; they leave the storage with the next sync" "Копии удалены; из хранилища они уйдут при следующей синхронизации"
       exit 0
     fi
-    say "These sessions changed on two Macs between syncs. The longer version stayed under the" \
-      "Эти сессии менялись на двух Mac между синхронизациями. Под основным именем осталась"
-    say "main name, a copy of the other one is next to it (Claude Code doesn't show it):" \
-      "более длинная версия, копия другой — рядом (Claude Code её не показывает):"
-    printf '%s\n' "$files" | while IFS= read -r f; do
-      printf '  %s  (%s)\n' "${f/#$HOME/~}" "$(du -h "$f" | cut -f1)"
-    done
-    say "If the copy is not needed: sessync conflicts --delete" "Если копия не нужна: sessync conflicts --delete" ;;
+    if [ -z "$files$forks" ]; then say "No conflicts" "Конфликтов нет"; rm -f "$st/conflicts"; exit 0; fi
+    if [ -n "$forks" ]; then
+      say "These sessions went two ways on two Macs. One branch kept the session, the other is a" \
+        "Эти сессии на двух Mac пошли по-разному. Одна ветка осталась в сессии, другая стала"
+      say "separate session «… (Branch)» — both are in /resume:" \
+        "отдельной сессией «… (Branch)» — обе есть в /resume:"
+      printf '%s\n' "$forks" | while IFS=$'\t' read -r when fid title; do
+        printf '  %s  %s\n      claude -r %s\n' "${when:0:16}" "${title}" "$fid"
+      done
+    fi
+    if [ -n "$files" ]; then
+      [ -n "$forks" ] && echo
+      say "Copies of files that changed on two Macs between syncs. The bigger version stayed under" \
+        "Копии файлов, которые менялись на двух Mac между синхронизациями. Под основным именем"
+      say "the main name, a copy of the other one is next to it (Claude Code doesn't show it):" \
+        "осталась версия большего размера, копия другой — рядом (Claude Code её не показывает):"
+      printf '%s\n' "$files" | while IFS= read -r f; do
+        printf '  %s  (%s)\n' "${f/#$HOME/~}" "$(du -h "$f" | cut -f1)"
+      done
+      say "If the copies are not needed: sessync conflicts --delete" "Если копии не нужны: sessync conflicts --delete"
+    fi ;;
 
   trash)
     load_env || { say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; exit 1; }

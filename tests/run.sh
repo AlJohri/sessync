@@ -306,6 +306,109 @@ check "обрезанная версия сохранена копией" contai
 check "на Q снова полная версия" same P Q $L
 run Q conflicts --delete >/dev/null; run Q now >/dev/null; run P now >/dev/null
 
+echo "== Сессия разошлась на двух Mac: другая ветка — отдельная сессия, открытая сессия не меняется"
+mac K1; mac K2; mac K3
+meta() {  # meta A project id — одни служебные строки Claude Code: сессию открыли и закрыли через /exit
+  printf '{"type":"user","message":{"role":"user","content":"<command-name>/exit</command-name>"},"sessionId":"%s"}\n{"type":"last-prompt","lastPrompt":"x","sessionId":"%s"}\n' \
+    "$3" "$3" >> "$T/$1/projects/$2/$3.jsonl"
+}
+others() { ls "$T/$1/projects/$2" | grep '\.jsonl$' | grep -vx "$3.jsonl"; }   # другие сессии проекта
+waitrun() { local i; for i in $(seq 1 150); do pgrep -qf 'bin/sessync _run' || return 0; sleep 0.2; done; }
+S1=11111111-1111-4111-8111-111111111111
+k=$T/K1/projects/-tmp-k
+say K1 -tmp-k $S1 "общее начало"
+printf '{"type":"ai-title","aiTitle":"Ограничение запросов","sessionId":"%s"}\n' $S1 >> "$k/$S1.jsonl"
+run K1 now >/dev/null; run K2 now >/dev/null
+say K1 -tmp-k $S1 "ветка K1"
+say K2 -tmp-k $S1 "ветка K2, она длиннее ветки K1"
+run K1 now >/dev/null; run K2 now >/dev/null
+F=$(others K2 -tmp-k $S1)
+f=$T/K2/projects/-tmp-k/$F
+check "под именем сессии — более длинная ветка" contains "$T/K2/projects/-tmp-k/$S1.jsonl" "ветка K2"
+check "другая ветка — отдельная сессия, одна" test -n "$F" -a "$(printf '%s\n' "$F" | grep -c .)" = 1
+check "в ней общее начало и ветка K1" sh -c "grep -q 'общее начало' '$f' && grep -q 'ветка K1' '$f'"
+check "в ветке её собственный id" sh -c "! grep -q '\"sessionId\":\"$S1\"' '$f' && grep -q '\"sessionId\":\"${F%.jsonl}\"' '$f'"
+check "заголовок ветки — «… (Branch)»" contains "$f" '"customTitle":"Ограничение запросов (Branch)"'
+check "копий .conflict нет" test -z "$(find "$T/K2/projects/-tmp-k" -name '*.conflict*')"
+say K1 -tmp-k $S1 "K1 продолжает свою ветку, не зная о развилке, и пишет много текста"
+say K1 -tmp-k $S1 "и ещё одну длинную строку, так что его версия теперь длиннее версии K2"
+run K1 now >/dev/null; run K1 now >/dev/null
+check "K1: его ветка уже сессия — под именем остаётся версия K2" contains "$k/$S1.jsonl" "ветка K2"
+check "K1: в основной нет строк K1 после развилки" not contains "$k/$S1.jsonl" "ветка K1"
+check "K1: новые строки K1 дописаны в ветку" contains "$k/$F" "K1 продолжает"
+check "K1: ветка по-прежнему одна" test "$(others K1 -tmp-k $S1)" = "$F"
+run K2 now >/dev/null; run K3 now >/dev/null
+check "у всех одна и та же сессия" sh -c "cmp -s '$k/$S1.jsonl' '$T/K2/projects/-tmp-k/$S1.jsonl' && cmp -s '$k/$S1.jsonl' '$T/K3/projects/-tmp-k/$S1.jsonl'"
+check "и одна и та же ветка" sh -c "cmp -s '$k/$F' '$f' && cmp -s '$k/$F' '$T/K3/projects/-tmp-k/$F'"
+check "дальше спокойно" has K1 'отправлено файлов 0, получено 0' now
+check "conflicts называет ветку и команду" has K2 "claude -r ${F%.jsonl}" conflicts
+check "status называет разошедшуюся сессию" has K2 'Последняя разошедшаяся сессия' status
+
+S2=22222222-2222-4222-8222-222222222222
+say K1 -tmp-k2 $S2 "начало второй"
+run K1 now >/dev/null; run K2 now >/dev/null
+say K2 -tmp-k2 $S2 "настоящее продолжение на K2"
+meta K1 -tmp-k2 $S2
+run K2 now >/dev/null; run K1 now >/dev/null; run K2 now >/dev/null
+check "одни служебные строки — не повод для ветки" test -z "$(others K1 -tmp-k2 $S2)"
+check "на K1 — переписка с K2" contains "$T/K1/projects/-tmp-k2/$S2.jsonl" "настоящее продолжение"
+check "служебные строки K1 убраны" not contains "$T/K1/projects/-tmp-k2/$S2.jsonl" "command-name"
+check "K1 и K2 одинаковы" same K1 K2 -tmp-k2/$S2.jsonl
+
+S3=33333333-3333-4333-8333-333333333333
+k3=$T/K1/projects/-tmp-k3/$S3.jsonl
+say K1 -tmp-k3 $S3 "начало третьей"
+run K1 now >/dev/null; run K2 now >/dev/null
+mkdir -p "$T/K1/sessions"; printf '{"pid":%s,"sessionId":"%s"}\n' $$ $S3 > "$T/K1/sessions/$$.json"
+say K2 -tmp-k3 $S3 "дописано на K2, пока на K1 сессия открыта"
+run K2 now >/dev/null; run K1 now >/dev/null
+check "открытая здесь сессия не меняется" not contains "$k3" "дописано на K2"
+check "о ней сказано: ждёт закрытия" grep -q "^$S3	" "$(stf K1 held)"
+rm "$T/K1/sessions/$$.json"; run K1 now >/dev/null
+check "закрыли — дописанное пришло" contains "$k3" "дописано на K2"
+printf '{"pid":%s,"sessionId":"%s"}\n' $$ $S3 > "$T/K1/sessions/$$.json"
+say K1 -tmp-k3 $S3 "K1 пишет в открытой сессии"
+say K2 -tmp-k3 $S3 "K2 пишет своё, и это гораздо длиннее того, что пишет K1"
+run K2 now >/dev/null; run K1 now >/dev/null
+check "открыта, а побеждает другая версия — файл не тронут" sh -c "grep -q 'K1 пишет' '$k3' && ! grep -q 'K2 пишет' '$k3'"
+check "и ветки пока нет" test -z "$(others K1 -tmp-k3 $S3)"
+rm "$T/K1/sessions/$$.json"; run K1 now >/dev/null
+check "закрыли — под именем версия K2" sh -c "grep -q 'K2 пишет' '$k3' && ! grep -q 'K1 пишет' '$k3'"
+check "а строки K1 — в отдельной сессии-ветке" sh -c "grep -l 'K1 пишет' '$T/K1/projects/-tmp-k3/'*.jsonl | grep -vq '$S3'"
+
+S4=44444444-4444-4444-8444-444444444444
+k4=$T/K1/projects/-tmp-k4/$S4.jsonl
+say K1 -tmp-k4 $S4 "начало четвёртой"
+run K1 now >/dev/null; run K2 now >/dev/null
+say K2 -tmp-k4 $S4 "продолжение на K2"
+run K2 now >/dev/null
+hook() { printf '{"session_id":"%s","source":"%s"}' "$2" "$3" | ss "$1" hook start > "$T/hook.out" 2>&1; }
+hook K1 $S4 resume
+check "claude -r старой версии: предупреждение" jq -e --arg s "$S4" '.systemMessage | contains("claude -r " + $s) and contains("hostK2")' "$T/hook.out"
+check "и подсказка для Claude" jq -e '.hookSpecificOutput.additionalContext | contains("older")' "$T/hook.out"
+check "файл открытой сессии не тронут" not contains "$k4" "продолжение на K2"
+run K1 now >/dev/null
+check "после выхода — свежая версия" contains "$k4" "продолжение на K2"
+hook K1 $S4 resume
+check "свежая — без предупреждения" test ! -s "$T/hook.out"
+hook K1 $S4 startup; waitrun
+check "новая сессия — хук молчит" test ! -s "$T/hook.out"
+say K2 -tmp-k4 $S4 "ещё с K2, пока на K1 сессия закрывается"
+run K2 now >/dev/null
+sleep 3 & spid=$!
+printf '{"pid":%s,"sessionId":"%s"}\n' $spid $S4 > "$T/K1/sessions/$spid.json"
+printf '{"session_id":"%s"}' $S4 | ss K1 hook end
+for i in $(seq 1 75); do grep -q 'пока на K1 сессия закрывается' "$k4" && break; sleep 0.2; done
+check "хук конца ждёт выхода claude и получает дописанное" contains "$k4" "пока на K1 сессия закрывается"
+wait $spid 2>/dev/null; rm -f "$T/K1/sessions/$spid.json"; waitrun
+
+mkdir "$(stf K1 lock)"
+(sleep 2; rmdir "$(stf K1 lock)") &
+check "sessync в терминале ждёт идущую синхронизацию и синхронизирует" "${SESSYNC_PYTHON:-python3}" -I "$here/tests/tty.py" \
+  --expect 'Жду, пока закончится' --expect 'Готово за' -- env CLAUDE_CONFIG_DIR="$T/K1" XDG_CONFIG_HOME="$T/K1/config" \
+  XDG_STATE_HOME="$T/K1/state" XDG_CACHE_HOME="$T/K1/cache" SESSYNC_HOST=hostK1 "$here/bin/sessync" now
+wait
+
 echo "== Корзина и возврат сессии с хвостами"
 say P -tmp-p4 segd "основа"
 run P now >/dev/null

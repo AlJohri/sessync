@@ -25,7 +25,8 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   `~/.claude/projects` (subagent links come from the storage as they are).
 - **Your terminal is safe from transcript text.** `sessync find` strips control characters (ESC/OSC
   sequences, BEL, bidi) before printing, so command output or page text stored in a transcript can't
-  run in your terminal.
+  run in your terminal. Session titles shown by `sessync conflicts` are cleaned the same way, and
+  notifications pass their text to `osascript` as an argument, never as part of the script.
 - **Mistakes are recoverable.** Deleted sessions stay in the trash for 30 days; a mass deletion
   stops the sync until you decide; a truncated transcript never overwrites a full one.
 

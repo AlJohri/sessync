@@ -40,10 +40,12 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    first saved to `pending` in the engine state, then done: an interrupted run finishes them. Only
    deleted files go to the trash, never old versions. `clean_trash` deletes folders older than
    `TRASH_DAYS` once a day. Other Macs' tails may be deleted only when their data is kept in
-   another form: folding or a new base (the same text), or a conflict where the losing version is
-   saved as a copy. Under a new base, off-chain tails go too: the file only grows (shorter is always
-   a conflict), so a tail starting inside the base can never attach again, and its data is with the
-   Mac that sent it. Own off-chain tails are garbage only after the file was settled in this run.
+   another form: folding or a new base (the same text), or a conflict where the other version is
+   kept as a branch session or a copy (only a continuation of Claude Code's service lines — no user
+   or assistant message — may go: it is not worth a branch). Under a new base, off-chain tails go
+   too: the file only grows (shorter is always a conflict), so a tail starting inside the base can
+   never attach again, and its data is with the Mac that sent it. Own off-chain tails are garbage
+   only after the file was settled in this run.
 3. **Storage format.** crypt parameters and the layout — `v1/` (`projects/`, `history/`,
    `seg/<tree>/<file path>/<tail>`, `trash/<date>/…`), `v1-check/keycheck`. The check file's first
    line (`cc-sync key check v1`, from the tool's old name) never changes; the second is the format
@@ -82,6 +84,21 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    `--opt=value`.
 10. **macOS only for now**: Keychain, `osascript`, `scutil`, `ioreg`. Keep new code portable (no
     `stat -f`, `date -j`), Linux is next.
+11. **The file of a session open on this Mac is not changed** (`opened`: Claude Code's registry
+    `~/.claude/sessions/` plus `--open`). Claude Code reads a transcript when it opens it and then
+    only appends: lines put into the file under it would split the conversation inside one file,
+    where Claude Code shows one branch and hides the other. Lines from another Mac and a losing
+    version wait (`hold`) until the session closes; the SessionEnd hook passes its id
+    (`--wait-closed`). The SessionStart hook on resume syncs in the foreground (20 s at most) and
+    may print one JSON object (a warning) — nothing else goes to its stdout.
+12. **Branches.** A session (`<project>/<uuid>.jsonl`) that went two ways becomes two sessions, as
+    Claude Code's `/branch` makes them. The branch id is `uuid5(FORK_NS, "<session id>:<sha256 of
+    the first line where the versions part>")` and its file is the common start, a `custom-title`
+    line "<title> (Branch)", then the continuation — with only `"sessionId":"<id>"` replaced. Every
+    Mac must compute the same bytes: a Mac with more of the same branch only appends, and a branch
+    that already exists gives way (its Mac appends to it instead of splitting again). So
+    `FORK_NS`, the id scheme and the file layout never change; the title comes only from the
+    transcript (never the interface language).
 
 ## Checking
 
