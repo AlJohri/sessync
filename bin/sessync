@@ -1,0 +1,1009 @@
+#!/bin/bash
+# sessync — Claude Code sessions on all your Macs, through storage you own, encrypted on the Mac.
+# Docs: README.md (English), README.ru.md (по-русски). Rules for changing the code: CLAUDE.md.
+#
+# What: ~/.claude/projects (transcripts, their attachments, subagent sessions; not memory/ folders)
+# and ~/.claude/history.jsonl (prompt history, merged line by line). Transcripts and history are only
+# appended to, so only the appended lines travel; attachments go whole (lib/engine.py over rclone crypt).
+# When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
+# When the last claude closes, the background loop ends by itself.
+set -u
+VERSION=2.0.0
+# Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
+# like Claude Code's own transcripts
+umask 077
+
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"                       # Claude Code data
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/sessync/config"          # storage settings, no secrets
+st="${XDG_STATE_HOME:-$HOME/.local/state}/sessync"               # log, status marks, engine state
+logf="$st/sync.log"
+self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+# lib/ of the install: the command on PATH is usually a symlink to bin/sessync
+_p="$0"
+while [ -L "$_p" ]; do _l=$(readlink "$_p"); case $_l in /*) _p=$_l ;; *) _p="$(dirname "$_p")/$_l" ;; esac; done
+LIB="$(cd "$(dirname "$_p")/.." && pwd -P)/lib"
+CHECK_TEXT="cc-sync key check v1"   # never changes: every version compares the first line
+# Storage format — second line of the check file. 2: transcripts are a base plus appended tails.
+# A newer format stops older versions instead of letting them write the old way
+FORMAT=2
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"   # hooks and the loop start without a profile
+PY=${SESSYNC_PYTHON:-python3}   # python 3.9 or newer; the tests also run /usr/bin/python3
+
+STORAGE="" PROVIDER=Other ENDPOINT="" REGION="" BUCKET="" REMOTE="" INTERVAL=600
+KEYCHAIN_SERVICE=sessync TRASH_DAYS=30 UI_LANG=""
+if [ -f "$conf" ]; then
+  while IFS='=' read -r k v; do
+    v=${v%\"}; v=${v#\"}
+    case "$k" in
+      STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|INTERVAL|KEYCHAIN_SERVICE|TRASH_DAYS) printf -v "$k" '%s' "$v" ;;
+      LANGUAGE) UI_LANG=$v ;;
+    esac
+  done < <(grep -E '^[A-Z_]+=' "$conf")
+fi
+[ -n "$STORAGE" ] || { if [ -n "$REMOTE" ]; then STORAGE=rclone; else STORAGE=s3; fi; }
+
+# Interface language: SESSYNC_LANG, LANGUAGE in the config, the locale, the macOS language. en | ru
+ui_lang() {
+  local l=${SESSYNC_LANG:-$UI_LANG}
+  [ -n "$l" ] || l=${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}
+  case $l in ""|C|C.*|POSIX) l=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2s/[^A-Za-z]*\([A-Za-z]*\).*/\1/p') ;; esac
+  case $l in ru*) echo ru ;; *) echo en ;; esac
+}
+UI=$(ui_lang)
+export SESSYNC_LANG=$UI
+t() { if [ "$UI" = ru ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+say() { t "$@"; echo; }
+
+# Only for tests/run.sh: the "storage" is a local folder, secrets come from the environment
+# (SESSYNC_TEST_PASSPHRASE…) or the folder SESSYNC_TEST_KEYCHAIN, which stands in for the Keychain
+TEST_REMOTE="${SESSYNC_TEST_REMOTE:-}"
+
+log() { mkdir -p "$st"; chmod 700 "$st"; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$logf"; }
+notify() {
+  [ -n "$TEST_REMOTE" ] && return 0
+  osascript -e "display notification \"$1\" with title \"sessync\"" >/dev/null 2>&1 || true
+}
+
+secret() {
+  if [ -n "$TEST_REMOTE" ]; then
+    local n
+    n="SESSYNC_TEST_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+    if [ -n "${!n:-}" ]; then printf '%s\n' "${!n}"
+    else [ -n "${SESSYNC_TEST_KEYCHAIN:-}" ] && cat "$SESSYNC_TEST_KEYCHAIN/$1" 2>/dev/null; fi
+    return
+  fi
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null
+}
+
+# The secret goes to security through stdin, not as an argument: not visible in the process list
+kc_set() {
+  if [ -n "$TEST_REMOTE" ]; then   # tests never reach the real Keychain
+    [ -n "${SESSYNC_TEST_KEYCHAIN:-}" ] && mkdir -p "$SESSYNC_TEST_KEYCHAIN" \
+      && printf '%s\n' "$2" > "$SESSYNC_TEST_KEYCHAIN/$1"
+    return
+  fi
+  local v=${2//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' "$KEYCHAIN_SERVICE" "$1" "$v" \
+    | security -i >/dev/null
+}
+
+# stdin to the clipboard of this Mac only: no Universal Clipboard (iPhone, other Macs), marked
+# concealed and transient so clipboard managers (Raycast, Alfred, Maccy, Paste) don't keep it.
+# Empty stdin clears the clipboard. Tests use a separate named pasteboard, never the real one
+clip() {
+  [ -n "$TEST_REMOTE" ] && [ -z "${SESSYNC_TEST_PASTEBOARD:-}" ] && return 1
+  osascript -l JavaScript -e '
+function run(argv) {
+  ObjC.import("AppKit");
+  var data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  var s = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+  var pb = argv[0] ? $.NSPasteboard.pasteboardWithName(argv[0]) : $.NSPasteboard.generalPasteboard;
+  pb.prepareForNewContentsWithOptions(1);  // NSPasteboardContentsCurrentHostOnly
+  if (s.length > 0) {
+    pb.setStringForType(s, "public.utf8-plain-text");
+    pb.setStringForType($(""), "org.nspasteboard.ConcealedType");
+    pb.setStringForType($(""), "org.nspasteboard.TransientType");
+  }
+}' "${SESSYNC_TEST_PASTEBOARD:-}" >/dev/null
+}
+
+# Error mark for the status line; a notification only when the error is new
+set_error() {
+  mkdir -p "$st"
+  [ "$(head -1 "$st/error" 2>/dev/null)" = "$1" ] || notify "$(t "Sync: $1. Details: sessync status" "Синхронизация: $1. Подробности: sessync status")"
+  printf '%s\n' "$1" > "$st/error"
+  log "$(t ERROR ОШИБКА): $1"
+}
+
+storage_desc() {
+  if [ "$STORAGE" = rclone ]; then echo "rclone $REMOTE"
+  elif [ -n "$ENDPOINT" ]; then echo "$(t bucket бакет) $BUCKET ($ENDPOINT)"
+  else echo "$(t bucket бакет) $BUCKET (AWS ${REGION:-?})"; fi
+}
+
+load_env() {
+  local ak sk pp ob
+  mkdir -p "$st"; chmod 700 "$st"   # check_key logs here; on a new Mac setup runs before any sync
+  if [ "$STORAGE" = rclone ]; then
+    [ -n "$REMOTE" ] || return 1
+    pp=$(secret passphrase) || return 1
+    R=${REMOTE%/}     # the user's own rclone config: Google Drive, Dropbox, SFTP, WebDAV…
+  else
+    [ -n "$BUCKET" ] || return 1
+    if [ -n "$TEST_REMOTE" ]; then
+      pp=$(secret passphrase) || return 1
+    else
+      ak=$(secret s3-access-key) && sk=$(secret s3-secret-key) && pp=$(secret passphrase) || return 1
+    fi
+    [ -f "$st/rclone.conf" ] || : > "$st/rclone.conf"
+    export RCLONE_CONFIG="$st/rclone.conf"   # only the remotes below, nothing from the user's config
+    if [ -n "$TEST_REMOTE" ]; then
+      export RCLONE_CONFIG_STORE_TYPE=local
+      R="store:$TEST_REMOTE/$BUCKET"
+    else
+      export RCLONE_CONFIG_STORE_TYPE=s3 RCLONE_CONFIG_STORE_PROVIDER="$PROVIDER" \
+        RCLONE_CONFIG_STORE_REGION="$REGION" RCLONE_CONFIG_STORE_NO_CHECK_BUCKET=true \
+        RCLONE_CONFIG_STORE_ACCESS_KEY_ID="$ak" RCLONE_CONFIG_STORE_SECRET_ACCESS_KEY="$sk"
+      [ -n "$ENDPOINT" ] && export RCLONE_CONFIG_STORE_ENDPOINT="$ENDPOINT"
+      [ "$PROVIDER" = AWS ] || export RCLONE_CONFIG_STORE_FORCE_PATH_STYLE=true
+      R="store:$BUCKET"
+    fi
+  fi
+  ob=$(printf '%s\n' "$pp" | rclone obscure -) || return 1
+  # ss: — the data (contents and names encrypted); ssk: — the check file with a plain name, which
+  # shows that the password on this Mac is the one the data was written with
+  export RCLONE_CONFIG_SS_TYPE=crypt RCLONE_CONFIG_SS_REMOTE="$R/v1" RCLONE_CONFIG_SS_PASSWORD="$ob"
+  export RCLONE_CONFIG_SSK_TYPE=crypt RCLONE_CONFIG_SSK_REMOTE="$R/v1-check" \
+    RCLONE_CONFIG_SSK_PASSWORD="$ob" RCLONE_CONFIG_SSK_FILENAME_ENCRYPTION=off
+}
+
+# Claude Code names a project folder after its path: every non-alphanumeric character becomes "-"
+enc() { printf '%s' "${1%/}" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# A different password on a new Mac would silently write a second, unreadable copy — refuse.
+# The format: newer than this version — don't touch; older — raise to FORMAT before any write, so
+# old versions on other Macs stop. The home folder of the first Mac is the storage's own: project
+# folders of Macs with another user name (another home) are renamed on the way in and out
+check_key() {
+  local c f h
+  if rclone lsf "$R/v1-check/" 2>/dev/null | grep -q .; then
+    c=$(rclone cat ssk:keycheck 2>/dev/null)
+    if [ "${c%%$'\n'*}" != "$CHECK_TEXT" ]; then
+      set_error "$(t "the encryption password is not the one used on your other Macs (sessync setup)" \
+        "пароль шифрования не тот, что на других Mac (sessync setup)")"
+      return 1
+    fi
+    f=$(printf '%s\n' "$c" | sed -n 's/^format \([0-9][0-9]*\)$/\1/p')
+    f=${f:-1}
+    h=$(printf '%s\n' "$c" | sed -n 's/^home \(\/.*\)$/\1/p' | head -1)
+    if [ "$f" -gt "$FORMAT" ]; then
+      set_error "$(t "the storage is in a newer format than this version — update sessync" \
+        "хранилище в формате новее этой версии — обновите sessync")"
+      return 1
+    fi
+    if [ "$f" -lt "$FORMAT" ] || [ -z "$h" ]; then
+      h=${h:-${HOME%/}}
+      printf '%s\nformat %s\nhome %s\n' "$CHECK_TEXT" "$FORMAT" "$h" | rclone rcat ssk:keycheck 2>>"$logf" \
+        || { set_error "$(t "could not write to the storage" "не удалось записать в хранилище")"; return 1; }
+      log "$(t "storage format $f → $FORMAT, home $h" "формат хранилища $f → $FORMAT, домашняя папка $h")"
+    fi
+  else
+    # a folder on an rclone remote (gdrive:sessync) may not exist yet; a bucket is created by the user
+    [ "$STORAGE" = rclone ] && rclone mkdir "$R" 2>/dev/null
+    if ! rclone lsf "$R" >/dev/null 2>&1; then
+      set_error "$(t "no access to the storage ($(storage_desc)): network or keys" \
+        "нет доступа к хранилищу ($(storage_desc)): сеть или ключи")"
+      return 1
+    fi
+    if rclone lsf "$R/v1/" 2>/dev/null | grep -q .; then
+      set_error "$(t "the storage has data but no check file — check it by hand" \
+        "в хранилище есть данные без контрольного файла — проверьте вручную")"
+      return 1
+    fi
+    h=${HOME%/}
+    printf '%s\nformat %s\nhome %s\n' "$CHECK_TEXT" "$FORMAT" "$h" | rclone rcat ssk:keycheck 2>>"$logf" \
+      || { set_error "$(t "could not write to the storage" "не удалось записать в хранилище")"; return 1; }
+    log "$(t "empty storage — check file written" "хранилище пустое — записан контрольный файл пароля")"
+  fi
+  HOME_CANON=$h
+  printf '%s\n' "$h" > "$st/home"   # for find and restore, which work offline
+}
+
+# The storage's home folder (written by check_key); this Mac's if not synced yet
+canon_home() { head -1 "$st/home" 2>/dev/null || echo "${HOME%/}"; }
+
+# Project folder name in the storage → on this Mac (another user name — another home prefix)
+local_key() {
+  local rh lh first rest
+  rh=$(enc "$(canon_home)") lh=$(enc "$HOME")
+  first=${1%%/*} rest=${1#"$first"}
+  if [ "$rh" != "$lh" ] && { [ "$first" = "$rh" ] || [ "${first#"$rh"-}" != "$first" ]; }; then
+    first="$lh${first#"$rh"}"
+  fi
+  printf '%s%s\n' "$first" "$rest"
+}
+
+# Claude Code deletes sessions older than cleanupPeriodDays (30 by default) at startup, and the
+# deletion would reach the storage and the other Macs
+retention_ok() {
+  local d
+  d=$("$PY" -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cleanupPeriodDays", 30))' \
+    "$cfg/settings.json" 2>/dev/null) || d=30
+  [[ $d =~ ^[0-9]+$ ]] && [ "$d" -ge 3650 ]
+}
+
+# Under 10 years — set RETENTION in settings.json (with a backup), and this run goes in resync mode:
+# it deletes nothing and brings back from the storage what Claude Code already deleted
+RETENTION=36500
+FORCE_RESYNC="" RESYNC_KIND="" APPLY_DELETES=""
+fix_retention() {
+  local was
+  retention_ok && return 0
+  was=$("$PY" -I - "$cfg/settings.json" "$RETENTION" <<'PY'
+import json, os, shutil, sys, time
+# Through a symlink — into the file itself (settings.json is often a link into a dotfiles repo)
+p, want = os.path.realpath(sys.argv[1]), int(sys.argv[2])
+try:
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    shutil.copy2(p, p + time.strftime(".bak-sessync-%Y%m%d-%H%M%S"))
+except FileNotFoundError:
+    d = {}
+was = d.get("cleanupPeriodDays", 30)
+d["cleanupPeriodDays"] = want
+tmp = p + ".sessync.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+try:
+    shutil.copymode(p, tmp)
+except FileNotFoundError:
+    pass
+os.replace(tmp, p)
+print(was)
+PY
+) || return 1
+  FORCE_RESYNC=1
+  RESYNC_KIND=$(t "restored from the storage" "с восстановлением из архива")
+  log "$(t "cleanupPeriodDays was $was — set to $RETENTION; what Claude Code deleted comes back from the storage" \
+    "cleanupPeriodDays был $was — поставлен $RETENTION; удалённое Claude Code вернётся из архива")"
+  notify "$(t "Session retention was $was days — set to 100 years, deleted sessions come back" \
+    "Срок хранения сессий был $was дн. — поставлено 100 лет, удалённое вернётся из архива")"
+}
+
+# Name of this Mac's history file in the storage. Two Macs can have the same name (same model,
+# Migration Assistant), and each would take the other's file for its own, hence the start of
+# the hardware UUID
+host_id() {
+  local n u
+  [ -n "${SESSYNC_HOST:-}" ] && { echo "$SESSYNC_HOST"; return; }
+  n=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+  u=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4 }')
+  echo "$n${u:+-${u:0:8}}"
+}
+
+engine() { "$PY" -I "$LIB/engine.py" "$@"; }
+
+# Prompt history. Each Mac has its own file in the storage, ss:history/<host_id>.jsonl, which is
+# only appended to: its own new prompts go there, and only they travel. The "project" field holds a
+# path: in the storage — under the storage's home folder, here — under this Mac's
+merge_history() {
+  local hd="$st/history"
+  mkdir -p "$hd"
+  # No state yet (new Mac, reinstall): first take the files as they are, so this Mac's own file
+  # is continued, not started over
+  if [ ! -f "$st/engine/history.json" ]; then
+    rclone copy ss:history "$hd" --size-only 2>>"$st/run.log" || return 1
+  fi
+  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" <<'PY' || return 1
+import glob, json, os, sys
+local, hd, me, canon, home = sys.argv[1:6]
+canon, home = canon.rstrip("/"), home.rstrip("/")
+def conv(l, a, b):
+    if a == b or ('"' + a) not in l:
+        return l
+    try:
+        d = json.loads(l)
+    except ValueError:
+        return l
+    p = d.get("project")
+    if isinstance(p, str) and (p == a or p.startswith(a + "/")):
+        d["project"] = b + p[len(a):]
+        return json.dumps(d, ensure_ascii=False, separators=(",", ":"))
+    return l
+def lines(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+known = set()
+for p in glob.glob(os.path.join(hd, "*.jsonl")):
+    known.update(lines(p))
+try:  # whole lines only: Claude Code may be writing the last one right now
+    with open(local, encoding="utf-8") as f:
+        data = f.read()
+except FileNotFoundError:
+    data = ""
+mine = [conv(l, home, canon) for l in data[:data.rfind("\n") + 1].split("\n") if l.strip()]
+new = [l for l in dict.fromkeys(mine) if l not in known]
+own = os.path.join(hd, me + ".jsonl")
+if new:
+    with open(own, "ab") as f:
+        if f.tell():
+            with open(own, "rb") as r:
+                r.seek(-1, 2)
+                if r.read(1) != b"\n":
+                    f.write(b"\n")
+        f.write("".join(l + "\n" for l in new).encode("utf-8"))
+elif not os.path.exists(own):
+    open(own, "a").close()
+PY
+  engine sync history "$hd" ss:history ss:seg/history "$st/engine/history.json" --host "$HOST" \
+    --work "$st/engine/work-history" --no-deletes --log "$st/run.log" >/dev/null 2>>"$st/run.log" || return 1
+  # Other Macs' lines join this Mac's (no repeats), all by time. The file is read again right before
+  # it is replaced, so a prompt an open session wrote meanwhile is not lost
+  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" <<'PY' || return 1
+import glob, json, os, sys
+local, hd, me, canon, home = sys.argv[1:6]
+canon, home = canon.rstrip("/"), home.rstrip("/")
+def conv(l, a, b):
+    if a == b or ('"' + a) not in l:
+        return l
+    try:
+        d = json.loads(l)
+    except ValueError:
+        return l
+    p = d.get("project")
+    if isinstance(p, str) and (p == a or p.startswith(a + "/")):
+        d["project"] = b + p[len(a):]
+        return json.dumps(d, ensure_ascii=False, separators=(",", ":"))
+    return l
+def lines(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+have = set(lines(local))
+extra = []
+for p in sorted(glob.glob(os.path.join(hd, "*.jsonl"))):
+    if os.path.basename(p) == me + ".jsonl":
+        continue
+    for l in lines(p):
+        l = conv(l, canon, home)
+        if l not in have:
+            have.add(l)
+            extra.append(l)
+if extra:
+    def ts(l):
+        try:
+            return float(json.loads(l).get("timestamp") or 0)
+        except Exception:
+            return 0.0
+    merged = list(dict.fromkeys(lines(local) + extra))
+    merged.sort(key=ts)
+    tmp = local + ".sessync.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(merged) + "\n")
+    os.replace(tmp, local)
+PY
+}
+
+today() {  # date of the trash folder; tests can set it
+  if [ -n "$TEST_REMOTE" ] && [ -n "${SESSYNC_TEST_TODAY:-}" ]; then echo "$SESSYNC_TEST_TODAY"; else date +%F; fi
+}
+
+# Trash. Old versions of sessions are not worth keeping: transcripts are only appended to, and each
+# version contains the previous one whole. Only deletions lose data: what is deleted on this Mac,
+# the engine first copies to ss:trash/<date>/projects/ (transcript tails to
+# ss:trash/<date>/seg/projects/), inside the storage, without downloading
+
+# Once a day: trash folders older than TRASH_DAYS are deleted
+clean_trash() {
+  local cutoff d
+  [ "$(cat "$st/trash-cleaned" 2>/dev/null)" = "$(today)" ] && return 0
+  cutoff=$("$PY" -I -c 'import datetime,sys; print(datetime.date.fromisoformat(sys.argv[1]) - datetime.timedelta(days=int(sys.argv[2])))' \
+    "$(today)" "$TRASH_DAYS") || return 1
+  rclone lsf --dirs-only ss:trash 2>/dev/null | tr -d '/' | while IFS= read -r d; do
+    if [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ $d < $cutoff ]]; then
+      rclone purge "ss:trash/$d" 2>>"$st/run.log" \
+        && log "$(t "trash: deleted $d (older than $TRASH_DAYS days)" "корзина: удалено за $d (старше $TRASH_DAYS дн.)")"
+    fi
+  done
+  today > "$st/trash-cleaned"
+}
+
+sync_once() {
+  mkdir -p "$st"
+  chmod 700 "$st"
+  if [ -f "$st/off" ]; then say "Automatic sync is off: sessync on" "Автосинхронизация выключена: sessync on"; return 0; fi
+  find "$st/lock" -maxdepth 0 -mmin +120 -exec rmdir {} \; 2>/dev/null
+  if ! mkdir "$st/lock" 2>/dev/null; then
+    # The running sync may have listed the files before this session wrote its last lines (a big
+    # session uploads for minutes): let it run once more when done
+    touch "$st/again"
+    say "A sync is already running — it will run once more when it ends" "Синхронизация уже идёт — когда закончится, пройдёт ещё раз"
+    return 75
+  fi
+  trap 'rmdir "$st/lock" 2>/dev/null' EXIT
+  rm -f "$st/again"
+  local rc
+  sync_locked; rc=$?
+  rmdir "$st/lock" 2>/dev/null
+  trap - EXIT
+  return $rc
+}
+
+# Sync, and again if it was asked for while it ran (the hook of a closed session, sessync)
+sync_all() {
+  local i rc
+  for i in 1 2 3; do
+    sync_once; rc=$?
+    [ $rc -eq 0 ] && [ -f "$st/again" ] || break
+  done
+  return $rc
+}
+
+sync_locked() {
+  if ! command -v rclone >/dev/null; then set_error "$(t "rclone is missing (brew install rclone)" "нет rclone (brew install rclone)")"; return 1; fi
+  if ! fix_retention; then
+    set_error "$(t "settings.json can't be read — retention can't be checked" "settings.json не читается — срок хранения не проверить")"
+    return 1
+  fi
+  if ! load_env; then set_error "$(t "not set up (sessync setup)" "не настроено (sessync setup)")"; return 1; fi
+  check_key || return 1
+  # Storages have no folders, so this does nothing there; the local "storage" of the tests needs them
+  local d
+  for d in projects history seg/projects seg/history; do rclone mkdir "ss:$d" 2>/dev/null; done
+  HOST=$(host_id)
+
+  # Keep the log small: the last ~5 MB
+  if [ -f "$logf" ] && [ "$(wc -c < "$logf")" -gt 5000000 ]; then mv -f "$logf" "$logf.1"; fi
+
+  # resync — delete nothing, bring back what is missing (retention fixed, deletes --undo);
+  # apply — delete even if there are many deletions (deletes --apply)
+  local kind="" mode=normal res rc map=()
+  [ -f "$st/engine/projects.json" ] || kind=$(t "first sync" "первичная синхронизация")
+  [ -n "$FORCE_RESYNC" ] && { mode=resync; kind=${kind:-$RESYNC_KIND}; }
+  [ -n "$APPLY_DELETES" ] && mode=apply
+  # Another user name here: project folders are renamed between the storage's home and this one
+  [ "$(enc "$HOME_CANON")" != "$(enc "$HOME")" ] && map=("--map=$(enc "$HOME_CANON"):$(enc "$HOME")")
+
+  mkdir -p "$cfg/projects"
+  : > "$st/run.log"
+  : > "$st/deleted.txt"
+  local t0
+  t0=$(date +%s)
+  res=$(engine sync projects "$cfg/projects" ss:projects ss:seg/projects "$st/engine/projects.json" \
+    --host "$HOST" --work "$st/engine/work-projects" --mode "$mode" --skip-memory \
+    --trash "ss:trash/$(today)" --sessions "$cfg/sessions" --deleted-out "$st/deleted.txt" \
+    ${map[@]+"${map[@]}"} --log "$st/run.log" 2>>"$st/run.log"); rc=$?
+  local up=0 down=0 bup=0 bdown=0 hist_ok=1
+  [ $rc -eq 0 ] && read -r up down bup bdown <<<"$res"
+  merge_history || hist_ok=""
+  cat "$st/run.log" >> "$logf"
+
+  local n
+  n=$(find "$cfg/projects" -name '*.conflict[0-9]*' -not -path '*/memory/*' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$n" -gt 0 ]; then
+    [ "$(head -1 "$st/conflicts" 2>/dev/null)" = "$n" ] \
+      || notify "$(t "A session changed on two Macs: $n copies. Review: sessync conflicts" \
+        "Сессия менялась на двух Mac: копий $n. Разобрать: sessync conflicts")"
+    echo "$n" > "$st/conflicts"
+  else
+    rm -f "$st/conflicts"
+  fi
+
+  local secs=$(( $(date +%s) - t0 ))
+  if [ $rc -ne 0 ]; then
+    if [ $rc -eq 3 ]; then
+      touch "$st/deletes-stop"
+      set_error "$(t "stopped: too many deletions — sessync deletes" "остановлено: слишком много удалений — sessync deletes")"
+    else
+      set_error "$(t "did not finish (code $rc), will retry — sessync log" "не завершилась (код $rc), повторю позже — sessync log")"
+    fi
+    return 1
+  fi
+  [ -n "$hist_ok" ] || { set_error "$(t "prompt history not synced — sessync log" "история промптов не синхронизирована — sessync log")"; return 1; }
+  rm -f "$st/error" "$st/deletes-stop"
+  clean_trash || log "$(t "trash: cleanup failed, will retry tomorrow" "корзина: очистка не удалась, повторю завтра")"
+  # Contract with status lines: time, epoch, sent, received, seconds, kind.
+  # Only the last field may be empty (read with IFS=tab merges empty fields)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$(date +%s)" "$up" "$down" "$secs" \
+    "$kind" > "$st/last"
+  log "$(t "done: sent $up ($(kb "$bup")), received $down ($(kb "$bdown")), $secs s${kind:+, $kind}" \
+    "готово: отправлено $up ($(kb "$bup")), получено $down ($(kb "$bdown")), $secs с${kind:+, $kind}")"
+}
+
+kb() { echo "$(( ($1 + 1023) / 1024 )) $(t KB КБ)"; }
+
+loop_alive() {
+  local pid
+  pid=$(cat "$st/loop.pid" 2>/dev/null) || return 1
+  kill -0 "$pid" 2>/dev/null && ps -o command= -p "$pid" | grep -q 'sessync _loop'
+}
+
+ask_secret() {  # $1 — Keychain entry, $2 — prompt
+  local v
+  if secret "$1" >/dev/null; then
+    printf '%s' "$(t "$2 is already saved. Enter keeps it, or paste a new value: " "$2 уже есть. Enter — оставить, или вставьте новое значение: ")"
+  else
+    printf '%s: ' "$2"
+  fi
+  read -rs v; echo
+  [ -z "$v" ] || kc_set "$1" "$v" || { say "!! Could not save to the Keychain: $1" "!! Не удалось сохранить в Связку ключей: $1"; return 1; }
+}
+
+# Result for a person; code 75 — a sync was already running (it will run again itself), not an error
+report() {
+  local rc=$1 when epoch up down secs kind
+  [ "$rc" -eq 75 ] && return 0
+  if [ "$rc" -eq 0 ] && [ -f "$st/last" ] && [ ! -f "$st/off" ]; then
+    IFS=$'\t' read -r when epoch up down secs kind < "$st/last"
+    say "Done in $secs s — sent: $up, received: $down${kind:+ ($kind)}" \
+      "Готово за $secs с: отправлено файлов $up, получено $down${kind:+ — $kind}"
+  fi
+  [ -f "$st/error" ] && echo "$(t Error Ошибка): $(cat "$st/error")"
+  [ -f "$st/conflicts" ] && echo "$(t Conflicts Конфликтов): $(cat "$st/conflicts") — sessync conflicts"
+  return 0
+}
+
+# Claude Code hooks: sync at session start and end. The command is the installed path of sessync
+# (~/.local/bin or Homebrew), stable across updates
+hook_bin() {
+  local b=${SESSYNC_BIN:-}
+  [ -n "$b" ] || b=$(command -v sessync 2>/dev/null) || true
+  [ -n "$b" ] || b=$self
+  echo "${b/#$HOME/~}"
+}
+hooks() {
+  local settings="$cfg/settings.json" b hs he ok backup tmp
+  command -v jq >/dev/null || { say "jq is needed: brew install jq" "Нужен jq: brew install jq"; return 1; }
+  if [ "${1:-}" = remove ]; then
+    [ -f "$settings" ] || return 0
+    jq -e '[.hooks[]?[]?.hooks[]?.command // empty] | any(test("(cc-sync|sessync) hook"))' "$settings" >/dev/null || return 0
+    hs=""
+  else
+    b=$(hook_bin)
+    hs="[ -x $b ] && $b hook start || true" he="[ -x $b ] && $b hook end || true"
+    mkdir -p "$cfg"
+    [ -f "$settings" ] || echo '{}' > "$settings"
+    ok=$(jq --arg s "$hs" --arg e "$he" '
+      ([.hooks.SessionStart[]?.hooks[]?.command] | index($s) != null)
+      and ([.hooks.SessionEnd[]?.hooks[]?.command] | index($e) != null)
+      and ([.hooks[]?[]?.hooks[]?.command // empty] | map(select(test("cc-sync hook"))) | length == 0)
+      and ((.cleanupPeriodDays // 30) >= 3650)' "$settings") \
+      || { say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
+    if [ "$ok" = true ]; then say "-- hooks already in place" "-- hook'и уже на месте"; return 0; fi
+  fi
+  backup="$settings.bak-sessync-$(date +%Y%m%d-%H%M%S)"
+  cp "$settings" "$backup"
+  tmp="$settings.sessync.tmp"
+  # Earlier entries of sessync (and of cc-sync, its old name) go, other hooks stay. Into a temporary
+  # file first: a jq failure must not leave an empty settings.json
+  jq --arg s "$hs" --arg e "${he:-}" --argjson r "$RETENTION" '
+    def strip: map(.hooks = ((.hooks // []) | map(select((.command // "") | test("(cc-sync|sessync) hook") | not))))
+               | map(select((.hooks | length) > 0));
+    .hooks //= {}
+    | .hooks |= with_entries(.value |= strip) | .hooks |= with_entries(select((.value | length) > 0))
+    | if $s == "" then (if (.hooks | length) == 0 then del(.hooks) else . end) else
+        .hooks.SessionStart = ((.hooks.SessionStart // []) + [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": $s}]}])
+        | .hooks.SessionEnd = ((.hooks.SessionEnd // []) + [{"hooks": [{"type": "command", "command": $e}]}])
+        | if (.cleanupPeriodDays // 30) < 3650 then .cleanupPeriodDays = $r else . end
+      end
+  ' "$backup" > "$tmp" || { rm -f "$tmp"; say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
+  # cat, not mv: the file keeps its permissions, and a symlinked settings.json stays a symlink
+  cat "$tmp" > "$settings"; rm -f "$tmp"
+  if [ -n "$hs" ]; then say "-- hooks added; previous file: ${backup/#$HOME/~}" "-- hook'и добавлены; прежний файл: ${backup/#$HOME/~}"
+  else say "-- hooks removed; previous file: ${backup/#$HOME/~}" "-- hook'и убраны; прежний файл: ${backup/#$HOME/~}"; fi
+}
+
+usage() {
+  if [ "$UI" = ru ]; then cat <<'EOF'
+sessync — сессии Claude Code на всех ваших Mac, через ваше хранилище, с шифрованием на Mac.
+
+  sessync              синхронизировать сейчас
+  sessync status       что и когда синхронизировано, ошибки, конфликты (--remote — объём в хранилище)
+  sessync find СЛОВА   найти сессии по переписке, в том числе с других Mac (sessync find -h)
+  sessync off | on     выключить / включить автоматическую синхронизацию
+  sessync conflicts    копии сессий, менявшихся на двух Mac между синхронизациями (--delete)
+  sessync trash        удалённые сессии в корзине хранилища (хранятся 30 дн., TRASH_DAYS)
+  sessync restore ID   вернуть сессию из корзины (id или часть пути)
+  sessync deletes      синхронизация остановлена из-за массового удаления: --undo / --apply
+  sessync setup        хранилище, ключи и пароль шифрования (в своём терминале)
+  sessync export       по шагам сохранить ключи и пароль в «Пароли» — для других Mac
+  sessync hooks install | remove   hook'и Claude Code в ~/.claude/settings.json
+  sessync statusline   короткое состояние для строки статуса Claude Code
+  sessync log [N]      последние строки журнала
+  sessync version
+EOF
+  else cat <<'EOF'
+sessync — Claude Code sessions on all your Macs, through storage you own, encrypted on the Mac.
+
+  sessync              sync now
+  sessync status       what was synced and when, errors, conflicts (--remote: size in the storage)
+  sessync find WORDS   find sessions by what was said, including ones from other Macs (sessync find -h)
+  sessync off | on     turn automatic sync off / on
+  sessync conflicts    copies of sessions changed on two Macs between syncs (--delete)
+  sessync trash        deleted sessions in the storage trash (kept 30 days, TRASH_DAYS)
+  sessync restore ID   bring a session back from the trash (id or part of the path)
+  sessync deletes      sync stopped because of a mass deletion: --undo / --apply
+  sessync setup        storage, keys and the encryption password (in your own terminal)
+  sessync export       save keys and password to the Passwords app, step by step — for other Macs
+  sessync hooks install | remove   Claude Code hooks in ~/.claude/settings.json
+  sessync statusline   short state for your Claude Code status line
+  sessync log [N]      last lines of the log
+  sessync version
+EOF
+  fi
+}
+
+# Storage choice for setup: presets of popular providers, any S3, or any rclone remote
+setup_storage() {
+  local c v
+  say "Where to keep the sessions? Everything is encrypted on this Mac before it leaves." \
+    "Где хранить сессии? Всё шифруется на этом Mac, до отправки."
+  say "  1) Cloudflare R2 — 10 GB free, no download fees (recommended)" "  1) Cloudflare R2 — 10 ГБ бесплатно, скачивание бесплатно (советую)"
+  say "  2) Backblaze B2 — 10 GB free" "  2) Backblaze B2 — 10 ГБ бесплатно"
+  say "  3) Amazon S3" "  3) Amazon S3"
+  say "  4) Other S3-compatible storage (by its endpoint)" "  4) Другое S3-совместимое хранилище (по адресу endpoint)"
+  say "  5) Any rclone remote: Google Drive, Dropbox, OneDrive, SFTP, WebDAV… (set it up first: rclone config)" \
+    "  5) Любое хранилище rclone: Google Drive, Dropbox, OneDrive, SFTP, WebDAV… (сначала: rclone config)"
+  read -rp "$(t 'Choice [1-5]: ' 'Выбор [1-5]: ')" c
+  case $c in
+    1) read -rp "$(t 'Cloudflare account ID (R2 → Overview, right column): ' 'ID аккаунта Cloudflare (R2 → Overview, справа): ')" v
+       [ -n "$v" ] || return 1
+       STORAGE=s3 PROVIDER=Cloudflare ENDPOINT="https://$v.r2.cloudflarestorage.com" REGION=auto REMOTE="" ;;
+    2) read -rp "$(t 'B2 region (from the bucket endpoint, e.g. us-west-004): ' 'Регион B2 (из endpoint бакета, например us-west-004): ')" v
+       [ -n "$v" ] || return 1
+       STORAGE=s3 PROVIDER=Other ENDPOINT="https://s3.$v.backblazeb2.com" REGION="$v" REMOTE="" ;;
+    3) read -rp "$(t 'AWS region (e.g. eu-central-1): ' 'Регион AWS (например, eu-central-1): ')" v
+       [ -n "$v" ] || return 1
+       STORAGE=s3 PROVIDER=AWS ENDPOINT="" REGION="$v" REMOTE="" ;;
+    4) read -rp "$(t 'Endpoint (https://…): ' 'Адрес (endpoint, https://…): ')" v
+       [ -n "$v" ] || return 1
+       ENDPOINT=$v
+       read -rp "$(t 'Region (Enter if the provider has none): ' 'Регион (Enter, если у провайдера его нет): ')" v
+       STORAGE=s3 PROVIDER=Other REGION="$v" REMOTE="" ;;
+    5) rclone listremotes 2>/dev/null | sed 's/^/   /'
+       read -rp "$(t 'Remote and folder (e.g. gdrive:sessync): ' 'Хранилище и папка (например, gdrive:sessync): ')" v
+       case $v in *:*) ;; *) say "Needs a remote name and a colon, as in rclone listremotes" "Нужно имя хранилища с двоеточием, как в rclone listremotes"; return 1 ;; esac
+       STORAGE=rclone REMOTE="$v" PROVIDER="" ENDPOINT="" REGION="" BUCKET="" ;;
+    *) return 1 ;;
+  esac
+  if [ "$STORAGE" = s3 ]; then
+    say "Create a private bucket for the sessions only, and keys with access to this bucket only." \
+      "Создайте приватный бакет только для сессий и ключи с доступом только к нему."
+    read -rp "$(t 'Bucket name: ' 'Имя бакета: ')" v
+    [ -n "$v" ] || return 1
+    BUCKET=$v
+  fi
+  mkdir -p "$(dirname "$conf")"
+  # The other lines (KEYCHAIN_SERVICE, TRASH_DAYS, INTERVAL) stay
+  { grep -vE '^(STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|LANGUAGE)=' "$conf" 2>/dev/null
+    printf 'STORAGE=%s\nPROVIDER=%s\nENDPOINT=%s\nREGION=%s\nBUCKET=%s\nREMOTE=%s\nLANGUAGE=%s\n' \
+      "$STORAGE" "$PROVIDER" "$ENDPOINT" "$REGION" "$BUCKET" "$REMOTE" "$UI"; } > "$conf.tmp" \
+    && cat "$conf.tmp" > "$conf"; rm -f "$conf.tmp"
+  say "Saved to ${conf/#$HOME/~}" "Сохранено в ${conf/#$HOME/~}"
+}
+
+case "${1:-now}" in
+  now)
+    sync_all; rc=$?
+    report $rc
+    [ $rc -eq 75 ] && rc=0
+    exit $rc ;;
+
+  hook)  # from Claude Code hooks: don't hold the session and print nothing
+    [ -f "$st/off" ] && exit 0
+    nohup "$self" _run >/dev/null 2>&1 &
+    if [ "${2:-}" = start ] && ! loop_alive; then
+      nohup "$self" _loop >/dev/null 2>&1 &
+    fi
+    exit 0 ;;
+
+  _run) sync_all >/dev/null 2>&1 ;;
+
+  _loop)
+    mkdir -p "$st"
+    echo $$ > "$st/loop.pid"
+    while sleep "$INTERVAL"; do
+      [ -f "$st/off" ] && break
+      pgrep -xq claude || break     # the last session closed — the loop ends by itself
+      "$self" _run
+    done
+    rm -f "$st/loop.pid" ;;
+
+  find) shift; SESSYNC_HOME_CANON=$(canon_home) exec "$PY" -I "$LIB/find.py" "$@" ;;
+
+  status)
+    if [ -n "$BUCKET$REMOTE" ]; then say "Storage: $(storage_desc), encrypted on this Mac" "Хранилище: $(storage_desc), данные зашифрованы на Mac"
+    else say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; fi
+    if [ -f "$st/off" ]; then say "Automatic sync: OFF (turn on: sessync on)" "Автосинхронизация: ВЫКЛЮЧЕНА (включить: sessync on)"
+    else say "Automatic sync: on — session start and end, every $((INTERVAL / 60)) min while claude is open" \
+      "Автосинхронизация: включена — старт и конец сессии, раз в $((INTERVAL / 60)) мин пока открыт claude"; fi
+    if loop_alive; then say "Background loop: running (pid $(cat "$st/loop.pid")), ends with the last session" \
+      "Фоновый цикл: работает (pid $(cat "$st/loop.pid")), закончится сам с последней сессией"
+    else say "Background loop: not running" "Фоновый цикл: не запущен"; fi
+    if [ -f "$st/last" ]; then
+      IFS=$'\t' read -r when epoch up down secs kind < "$st/last"
+      say "Last successful: $when — sent $up, received $down, $secs s${kind:+ ($kind)}" \
+        "Последняя удачная: $when — отправлено $up, получено $down, ${secs} с${kind:+ ($kind)}"
+    else say "Last successful: none yet" "Последняя удачная: ещё не было"; fi
+    [ -f "$st/error" ] && echo "$(t Error Ошибка): $(cat "$st/error")"
+    [ -f "$st/conflicts" ] && echo "$(t Conflicts Конфликтов): $(cat "$st/conflicts") — sessync conflicts"
+    retention_ok || say "Session retention (cleanupPeriodDays) is under 10 years — the next sync fixes it (sessync)" \
+      "Срок хранения сессий (cleanupPeriodDays) меньше 10 лет — исправит ближайшая синхронизация (sessync)"
+    if [ "$(enc "$(canon_home)")" != "$(enc "$HOME")" ]; then
+      say "Project folders: $(canon_home) in the storage = $HOME here" "Папки проектов: $(canon_home) в хранилище = $HOME здесь"
+    fi
+    sessions=$(find "$cfg/projects" -name '*.jsonl' -not -path '*/subagents/*' -not -path '*/memory/*' 2>/dev/null | wc -l | tr -d ' ')
+    say "Here: $sessions sessions, $(du -sh "$cfg/projects" 2>/dev/null | cut -f1)" "Локально: сессий $sessions, $(du -sh "$cfg/projects" 2>/dev/null | cut -f1)"
+    if [ "$STORAGE" = s3 ] && [ -n "$BUCKET" ] && [ -z "$TEST_REMOTE" ]; then
+      for a in s3-access-key s3-secret-key; do
+        secret "$a" >/dev/null || say "Not in the Keychain: $a — sessync setup" "Нет в Связке ключей: $a — sessync setup"
+      done
+    fi
+    secret passphrase >/dev/null || say "Not in the Keychain: passphrase — sessync setup" "Нет в Связке ключей: passphrase — sessync setup"
+    if [ "${2:-}" = --remote ] && load_env; then
+      echo "$(t "In the storage" "В хранилище"): $(rclone size "$R" --fast-list 2>/dev/null | grep -i 'total size' | sed 's/.*: //')"
+      rclone size ss:seg --fast-list --json 2>/dev/null | "$PY" -I -c '
+import json, os, sys
+d = json.load(sys.stdin)
+ru = os.environ.get("SESSYNC_LANG") == "ru"
+print(("  из них дописанные части сессий (хвосты): %d шт., %.1f МБ — сворачиваются, когда сессия затихает" if ru
+       else "  of it appended parts of sessions (tails): %d, %.1f MB — folded once a session goes quiet")
+      % (d["count"], d["bytes"] / 1048576))' 2>/dev/null
+    fi
+    echo "$(t Log Журнал): ${logf/#$HOME/~}" ;;
+
+  statusline)  # for your own status line: prints one short coloured part, or nothing
+    if [ -f "$st/conflicts" ]; then printf '\033[31m%s %s\033[0m\n' "$(t "sessions: conflict" "сессии: конфликт")" "$(head -1 "$st/conflicts")"
+    elif [ -f "$st/error" ]; then printf '\033[33m%s: %s\033[0m\n' "$(t sessions сессии)" "$(head -1 "$st/error")"
+    elif [ -f "$st/off" ]; then printf '\033[2m%s\033[0m\n' "$(t "sessions: sync off" "сессии: синхр. выкл")"
+    elif [ -f "$st/last" ] && IFS=$'\t' read -r when epoch _ < "$st/last" && [[ $epoch =~ ^[0-9]+$ ]]; then
+      if (( $(date +%s) - epoch > 1800 )); then printf '\033[33m%s ↻ %s\033[0m\n' "$(t sessions сессии)" "${when:11:5}"
+      else printf '\033[2m%s ↻ %s\033[0m\n' "$(t sessions сессии)" "${when:11:5}"; fi
+    fi ;;
+
+  off) mkdir -p "$st"; touch "$st/off"; say "Automatic sync is off. Turn on: sessync on" "Автосинхронизация выключена. Включить: sessync on" ;;
+  on)  rm -f "$st/off"; say "Automatic sync is on" "Автосинхронизация включена"; exec "$self" now ;;
+
+  log) tail -n "${2:-40}" "$logf" 2>/dev/null || say "No log yet" "Журнала ещё нет" ;;
+
+  conflicts)
+    files=$(find "$cfg/projects" -name '*.conflict[0-9]*' -not -path '*/memory/*' 2>/dev/null)
+    if [ -z "$files" ]; then say "No conflicts" "Конфликтов нет"; rm -f "$st/conflicts"; exit 0; fi
+    if [ "${2:-}" = --delete ]; then
+      printf '%s\n' "$files" | while IFS= read -r f; do rm -f -- "$f"; done
+      rm -f "$st/conflicts"
+      say "Copies deleted; they leave the storage with the next sync" "Копии удалены; из хранилища они уйдут при следующей синхронизации"
+      exit 0
+    fi
+    say "These sessions changed on two Macs between syncs. The longer version stayed under the" \
+      "Эти сессии менялись на двух Mac между синхронизациями. Под основным именем осталась"
+    say "main name, a copy of the other one is next to it (Claude Code doesn't show it):" \
+      "более длинная версия, копия другой — рядом (Claude Code её не показывает):"
+    printf '%s\n' "$files" | while IFS= read -r f; do
+      printf '  %s  (%s)\n' "${f/#$HOME/~}" "$(du -h "$f" | cut -f1)"
+    done
+    say "If the copy is not needed: sessync conflicts --delete" "Если копия не нужна: sessync conflicts --delete" ;;
+
+  trash)
+    load_env || { say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; exit 1; }
+    # Transcript tails (<date>/seg/projects/<file>/…) count into their file, not shown on their own
+    out=$(rclone lsl ss:trash 2>/dev/null | awk '{ path = $4; for (i = 5; i <= NF; i++) path = path " " $i
+        day = path; sub(/\/.*/, "", day); rest = substr(path, length(day) + 2)
+        if (sub(/^seg\/projects\//, "", rest)) { sub(/\/[^\/]*$/, "", rest); size[day "\t" rest] += $1; next }
+        if (sub(/^projects\//, "", rest)) { size[day "\t" rest] += $1; seen[day "\t" rest] = 1 } }
+      END { for (k in seen) printf "%s\t%d\n", k, size[k] }' | sort -r)
+    if [ -z "$out" ]; then say "The trash is empty" "Корзина пуста"; exit 0; fi
+    say "Deleted sessions and files (kept $TRASH_DAYS days from the deletion):" "Удалённые сессии и файлы (хранятся $TRASH_DAYS дн. с даты удаления):"
+    printf '%s\n' "$out" | awk -F'\t' -v w="$(t deleted удалено)" -v u="$(t KB КБ)" '{ printf "  %s %s  %s  (%d %s)\n", w, $1, $2, ($3 + 1023) / 1024, u }'
+    say "Restore: sessync restore <session id or part of the path>" "Вернуть: sessync restore <id сессии или часть пути>" ;;
+
+  restore)
+    [ -n "${2:-}" ] || { say "What to restore: sessync restore <session id or part of the path> (list: sessync trash)" \
+      "Что вернуть: sessync restore <id сессии или часть пути> (список — sessync trash)"; exit 1; }
+    load_env || { say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; exit 1; }
+    # For each path — the latest copy: later dates first
+    rclone lsf -R --files-only ss:trash 2>/dev/null | grep '^[^/]*/projects/' | grep -F -- "$2" | sort -r \
+      | awk '{ p = $0; sub(/^[^\/]*\/projects\//, "", p); if (!(p in seen)) { seen[p] = 1; print } }' \
+      > "$st/restore.txt"
+    if [ ! -s "$st/restore.txt" ]; then say "Not in the trash: $2 (list: sessync trash)" "В корзине нет: $2 (список — sessync trash)"; exit 1; fi
+    n=0
+    while IFS= read -r m; do
+      day=${m%%/*}; rel=${m#*/projects/}; loc=$(local_key "$rel")
+      if [ -e "$cfg/projects/${loc%.rclonelink}" ] || [ -L "$cfg/projects/${loc%.rclonelink}" ]; then
+        say "Already on this Mac: $loc" "Уже есть на этом Mac: $loc"; continue
+      fi
+      if [[ $rel == *.jsonl ]]; then
+        # a transcript is a base plus tails — assemble it into a file
+        engine fetch "ss:trash/$day/projects/$rel" "ss:trash/$day/seg/projects/$rel" "$cfg/projects/$loc" \
+          --log "$logf" 2>>"$logf"
+      elif [[ $rel == *.rclonelink ]]; then
+        mkdir -p "$(dirname "$cfg/projects/$loc")"
+        tgt=$(rclone cat "ss:trash/$day/projects/$rel" 2>>"$logf") && ln -s "$tgt" "$cfg/projects/${loc%.rclonelink}"
+      else
+        mkdir -p "$(dirname "$cfg/projects/$loc")"
+        rclone copyto "ss:trash/$day/projects/$rel" "$cfg/projects/$loc" 2>>"$logf"
+      fi
+      if [ $? -eq 0 ]; then
+        say "Restored: $loc" "Возвращено: $loc"; n=$((n + 1))
+      else
+        say "Could not restore: $loc (sessync log)" "Не удалось вернуть: $loc (sessync log)"
+      fi
+    done < "$st/restore.txt"
+    [ "$n" -gt 0 ] && say "It returns to the storage and your other Macs with the next sync (sessync)." \
+      "В хранилище и на другие Mac вернётся при следующей синхронизации (sessync)."
+    exit 0 ;;
+
+  deletes)  # sync stopped by the mass-deletion limit: the user decides
+    if [ ! -f "$st/deletes-stop" ]; then
+      say "Sync was not stopped because of deletions — nothing to confirm" "Синхронизация не останавливалась из-за удалений — подтверждать нечего"; exit 0
+    fi
+    case "${2:-}" in
+      --undo) FORCE_RESYNC=1 RESYNC_KIND=$(t "deleted files brought back from the storage" "удалённое возвращено из хранилища")
+              sync_all; rc=$?; report $rc; exit $rc ;;
+      --apply) APPLY_DELETES=1; sync_all; rc=$?; report $rc; exit $rc ;;
+    esac
+    info=$(sed -n 's/.*too many deletes (>[0-9]*%, \([0-9]*\) of \([0-9]*\)) on \(Path[12]\).*/\1 \2 \3/p' "$logf" | tail -1)
+    set -- $info
+    if [ "${3:-}" = Path2 ]; then
+      say "Sync stopped: more than half of the files are being deleted (${1:-?} of ${2:-?}) — in the storage (deleted on another Mac)." \
+        "Синхронизация остановлена: за раз удаляется больше половины файлов (${1:-?} из ${2:-?}) — в хранилище (удалили на другом Mac)."
+    else
+      say "Sync stopped: more than half of the files are being deleted (${1:-?} of ${2:-?}) — on this Mac." \
+        "Синхронизация остановлена: за раз удаляется больше половины файлов (${1:-?} из ${2:-?}) — на этом Mac."
+      if [ -s "$st/deleted.txt" ]; then
+        n=$(wc -l < "$st/deleted.txt" | tr -d ' ')
+        say "Deleted on this Mac:" "Удалены на этом Mac:"
+        head -20 "$st/deleted.txt" | sed 's/\.rclonelink$//; s/^/  /'
+        [ "$n" -gt 20 ] && say "  … $n in all" "  … всего $n"
+      fi
+    fi
+    echo
+    say "Deleted by mistake — bring back:     sessync deletes --undo" "Удалили по ошибке — вернуть:          sessync deletes --undo"
+    say "Deleted on purpose — delete everywhere: sessync deletes --apply" "Удаляли намеренно — удалить везде:    sessync deletes --apply"
+    say "                                       (copies stay in the trash for $TRASH_DAYS days: sessync trash)" \
+      "                                      (копии $TRASH_DAYS дн. лежат в корзине: sessync trash)" ;;
+
+  hooks)
+    case "${2:-}" in
+      install) hooks install ;;
+      remove) hooks remove ;;
+      *) say "sessync hooks install | remove" "sessync hooks install | remove"; exit 1 ;;
+    esac ;;
+
+  setup)
+    if [ ! -t 0 ]; then say "Run it in your own terminal: it asks for input that must not reach a chat" \
+      "Запустите в своём терминале: нужен ввод, который не должен попасть в чат"; exit 1; fi
+    command -v rclone >/dev/null || { say "Install first: ./install.sh or brew install rclone" "Сначала установите: ./install.sh (или brew install rclone)"; exit 1; }
+    if [ -z "$BUCKET$REMOTE" ] || [ "${2:-}" = --storage ]; then
+      setup_storage || { say "Storage not changed" "Хранилище не изменено"; exit 1; }
+    fi
+    if [ "$STORAGE" = s3 ]; then
+      case $PROVIDER in
+        Cloudflare) say "Keys: R2 → Manage API tokens → Create API token, Object Read & Write, this bucket only." \
+          "Ключи: R2 → Manage API tokens → Create API token, Object Read & Write, только этот бакет." ;;
+        AWS) say "Keys: an IAM user with access to this bucket only (Access key ID and Secret access key)." \
+          "Ключи: пользователь IAM с доступом только к этому бакету (Access key ID и Secret access key)." ;;
+        *) case $ENDPOINT in
+             *backblazeb2*) say "Keys: Application Keys → Add a New Application Key, this bucket only." \
+               "Ключи: Application Keys → Add a New Application Key, только этот бакет." ;;
+             *) say "Keys: an S3 key with access to this bucket only (not the key of the whole account)." \
+               "Ключи: S3-ключ с доступом только к этому бакету (не ключ всего аккаунта)." ;;
+           esac ;;
+      esac
+      ask_secret s3-access-key "S3 Access Key" && ask_secret s3-secret-key "S3 Secret Key" || exit 1
+    fi
+    if secret passphrase >/dev/null; then
+      ask_secret passphrase "$(t "Encryption password" "Пароль шифрования")" || exit 1
+    else
+      say "The encryption password is one for all your Macs. If another Mac is set up already, enter the same." \
+        "Пароль шифрования — один на все Mac. Если на другом Mac уже настроено, введите тот же."
+      printf '%s' "$(t "Password (Enter — create a new one, for the very first Mac only): " "Пароль (Enter — создать новый, только для самого первого Mac): ")"
+      read -rs p; echo
+      if [ -z "$p" ]; then
+        p=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+        say "A new 32-character password was created and saved in the Keychain." "Создан новый пароль (32 символа) и сохранён в Связке ключей."
+        say "Save a copy for your other Macs: sessync export" "Сохраните его копию для других Mac: sessync export"
+      elif [ ${#p} -lt 12 ]; then
+        say "Too short (under 12 characters)" "Слишком короткий пароль (меньше 12 символов)"; exit 1
+      fi
+      kc_set passphrase "$p" || { say "!! Could not save to the Keychain: passphrase" "!! Не удалось сохранить в Связку ключей: passphrase"; exit 1; }
+      unset p
+    fi
+    if load_env && check_key; then
+      rm -f "$st/error"
+      say "Done: the storage is reachable, the password matches." "Готово: доступ к хранилищу есть, пароль совпадает."
+      if ! jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("sessync hook"))' "$cfg/settings.json" >/dev/null 2>&1; then
+        read -rp "$(t "Add sessync hooks to ~/.claude/settings.json (sync at session start and end)? [Y/n] " \
+          "Добавить hook'и sessync в ~/.claude/settings.json (синхронизация на старте и в конце сессии)? [Y/n] ")" v
+        case $v in [nNнН]*) ;; *) hooks install ;; esac
+      fi
+      say "First sync: sessync" "Первая синхронизация: sessync"
+    else
+      echo "$(t "Check failed" "Проверка не прошла"): $(cat "$st/error" 2>/dev/null)"
+      exit 1
+    fi ;;
+
+  export)
+    if [ ! -t 0 ]; then say "Run it in your own terminal" "Запустите в своём терминале"; exit 1; fi
+    for a in passphrase $([ "$STORAGE" = s3 ] && echo s3-access-key s3-secret-key); do
+      secret "$a" >/dev/null || { say "Not in the Keychain: $a — run sessync setup first" "Нет в Связке ключей: $a — сначала sessync setup"; exit 1; }
+    done
+    if [ "$STORAGE" = rclone ]; then host=rclone.org
+    elif [ -n "$ENDPOINT" ]; then host=${ENDPOINT#*://}; host=${host%%/*}
+    else host=s3.amazonaws.com; fi
+    if [ "$UI" = ru ]; then cat <<'EOF'
+Сохраним пароль шифрования (и ключи хранилища) в приложение «Пароли»: на другом Mac их нужно будет
+вставить в sessync setup, а запись из «Паролей» сама появится там через iCloud.
+
+Значения по одному кладутся в буфер обмена только этого Mac (без «Универсального буфера»,
+мимо истории буфера) и на экран не выводятся.
+Enter нажимайте здесь, в Терминале, а не в «Паролях».
+
+EOF
+    else cat <<'EOF'
+Let's save the encryption password (and the storage keys) in the Passwords app: on another Mac you
+paste them into sessync setup, and the Passwords entry gets there through iCloud.
+
+The values go one by one to the clipboard of this Mac only (no Universal Clipboard, skipped by
+clipboard history) and are never shown on the screen.
+Press Enter here, in the Terminal, not in Passwords.
+
+EOF
+    fi
+    [ -n "$TEST_REMOTE" ] || open -a Passwords 2>/dev/null || true
+    say "Step 1 of 4. In Passwords, click «+» (at the top)." "Шаг 1 из 4. В открывшихся «Паролях» нажмите «+» (вверху)."
+    say "            In the Website field, type: $host" "            В поле «Веб-сайт» напишите адрес хранилища: $host"
+    say "            (it must be an address — Passwords won't save the entry with a plain name)" \
+      "            (нужен именно адрес — с обычным названием «Пароли» не сохранят запись)"
+    say "            Leave the other fields for now." "            Остальные поля пока не трогайте — их заполним на следующих шагах."
+    printf '            %s' "$(t "Come back here and press Enter. " "Вернитесь сюда и нажмите Enter. ")"
+    read -r _
+    if [ "$STORAGE" = s3 ]; then
+      secret s3-access-key | tr -d '\n' | clip
+      echo
+      say "Step 2 of 4. The clipboard holds the S3 Access Key (the short key)." "Шаг 2 из 4. В буфере обмена — S3 Access Key (короткий ключ)."
+      printf '            %s' "$(t "Paste it (⌘V) into the User Name field, come back and press Enter. " \
+        "Вставьте его (⌘V) в поле «Имя пользователя», вернитесь сюда и нажмите Enter. ")"
+    else
+      echo
+      say "Step 2 of 4. Type sessync into the User Name field, come back and press Enter." \
+        "Шаг 2 из 4. Впишите sessync в поле «Имя пользователя», вернитесь сюда и нажмите Enter."
+    fi
+    read -r _
+    secret passphrase | tr -d '\n' | clip
+    echo
+    say "Step 3 of 4. The clipboard holds the encryption password." "Шаг 3 из 4. В буфере обмена — пароль шифрования."
+    say "            Passwords already put its own random password into the Password field — replace it:" \
+      "            «Пароли» уже вписали в поле «Пароль» свой случайный пароль — его нужно заменить:"
+    say "            click the Password field, select all (⌘A) and paste (⌘V)." \
+      "            щёлкните в поле «Пароль», выделите всё (⌘A) и вставьте (⌘V)."
+    printf '            %s' "$(t "Come back here and press Enter. " "Вернитесь сюда и нажмите Enter. ")"
+    read -r _
+    { t "sessync — Claude Code sessions" "sessync — сессии Claude Code"; echo
+      if [ "$STORAGE" = s3 ]; then printf 'S3 Secret Key: '; secret s3-secret-key | tr -d '\n'; echo; fi
+      printf 'STORAGE=%s\nPROVIDER=%s\nENDPOINT=%s\nREGION=%s\nBUCKET=%s\nREMOTE=%s\n' \
+        "$STORAGE" "$PROVIDER" "$ENDPOINT" "$REGION" "$BUCKET" "$REMOTE"; } | clip
+    echo
+    say "Step 4 of 4. The clipboard holds the text for Notes: the S3 Secret Key and the storage settings." \
+      "Шаг 4 из 4. В буфере обмена — текст для заметок: S3 Secret Key и настройки хранилища."
+    say "            Paste it (⌘V) into the Notes field and click Save in Passwords." \
+      "            Вставьте его (⌘V) в поле «Заметки» и нажмите «Сохранить» в «Паролях»."
+    printf '            %s' "$(t "Come back here and press Enter — the clipboard gets cleared. " \
+      "Вернитесь сюда и нажмите Enter — буфер обмена очистится. ")"
+    read -r _
+    clip < /dev/null
+    echo
+    say "Done, the clipboard is clear. On another Mac: sessync setup — and paste the values from this entry." \
+      "Готово, буфер обмена очищен. На другом Mac: sessync setup — и вставляйте значения из этой записи." ;;
+
+  version|--version) echo "sessync $VERSION" ;;
+  -h|--help|help) usage ;;
+  *) say "Unknown command: $1 (sessync help)" "Неизвестная команда: $1 (sessync help)"; exit 1 ;;
+esac

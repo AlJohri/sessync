@@ -1,0 +1,16 @@
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  macos:
+    # macOS minutes of private repositories cost 10x; public ones are free
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install rclone ripgrep jq
+      - name: tests (Homebrew python)
+        run: tests/run.sh
+      - name: tests (system python 3.9)
+        run: SESSYNC_PYTHON=/usr/bin/python3 tests/run.sh
