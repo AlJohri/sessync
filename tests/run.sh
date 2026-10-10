@@ -381,6 +381,20 @@ check "X: получил сессию" contains "$T/X/projects/-tmp-rc/r1.jsonl"
 check "в хранилище rclone — шифротекст" absent "$T/rclone-remote" "через rclone"
 check "status называет хранилище rclone" has X 'rclone' status
 
+echo "== Ничего не пишется за пределы папки проектов"
+mkdir -p "$T/s3/bucket8" "$T/outside"
+for m in Y Z; do mac $m; setconf $m bucket8; done
+say Y -tmp-p8 y1 "обычная сессия"
+ln -s "$T/outside" "$T/Y/projects/-tmp-p8/sub"   # ссылка на папку вне projects
+run Y now >/dev/null; run Z now >/dev/null
+check "ссылка на папку пришла ссылкой" test -L "$T/Z/projects/-tmp-p8/sub"
+# файл «под ссылкой» в хранилище — так мог бы сделать только Mac с паролем
+at Y "printf 'чужое' | rclone rcat ss:projects/-tmp-p8/sub/evil.txt 2>/dev/null"
+check "файл под ссылкой: синхронизация проходит" run Z now
+check "через ссылку ничего не записано" test ! -e "$T/outside/evil.txt"
+check "в журнале названа причина" grep -q 'ссылка за пределы папки проектов' "$(stf Z sync.log)"
+check "обычная сессия рядом пришла" test -f "$T/Z/projects/-tmp-p8/y1.jsonl"
+
 echo "== English"
 en() { SESSYNC_LANG=en ss "$@"; }
 check "английский: итог синхронизации" sh -c "$(declare -f ss en); T='$T' here='$here'; en A now | grep -q 'Done in'"

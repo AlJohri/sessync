@@ -195,6 +195,12 @@ def ignored(name):
     return name == ".DS_Store" or name.endswith(".sessync.tmp")
 
 
+def unsafe(key):
+    """A path from the storage that would lead out of the folder: absolute, or with empty, "." or
+    ".." parts. Only a Mac with the password can write such names; they are skipped all the same."""
+    return key.startswith("/") or any(p in ("", ".", "..") for p in key.split("/"))
+
+
 def kind_of(key):
     return "link" if key.endswith(LINK) else "log" if key.endswith(".jsonl") else "whole"
 
@@ -298,6 +304,7 @@ class Engine:
     def __init__(self, a):
         self.a = a
         self.root, self.rbase, self.rseg = a.local, a.base, a.seg
+        self.rroot = os.path.realpath(self.root)
         self.host = re.sub(r"[^A-Za-z0-9.-]", "-", a.host)
         self.work = a.work
         try:
@@ -330,6 +337,15 @@ class Engine:
     def path_of(self, key):
         key = self.swap(key, self.mr, self.ml)
         return os.path.join(self.root, key[:-len(LINK)] if key.endswith(LINK) else key)
+
+    def inside(self, path):
+        """path is really under the folder: not through a link to a folder elsewhere (links come from
+        the storage as they are, and a file "under" one would be written wherever it points)."""
+        d = os.path.dirname(path)
+        while not os.path.lexists(d):
+            d = os.path.dirname(d)
+        d = os.path.realpath(d)
+        return d == self.rroot or d.startswith(self.rroot + os.sep)
 
     # ---- file lists ---------------------------------------------------------------------------
     @staticmethod
@@ -379,13 +395,16 @@ class Engine:
         rem = {}
         for it in listing(self.rbase):
             p = it["Path"]
+            if unsafe(p):
+                log(f"{p}: " + tx("a path out of the folder in the storage — skipped", "путь за пределы папки в хранилище — пропущен"))
+                continue
             parts = p.split("/")
             if ignored(parts[-1]) or (self.a.skip_memory and len(parts) > 2 and parts[1] == "memory"):
                 continue
             rem.setdefault(p, RFile()).base = (it["Size"], it.get("ModTime", ""))
         for it in listing(self.rseg):
             rel, _, name = it["Path"].rpartition("/")
-            s = parse_seg(name, it["Size"], it.get("ModTime", "")) if rel else None
+            s = parse_seg(name, it["Size"], it.get("ModTime", "")) if rel and not unsafe(rel) else None
             if s:
                 rem.setdefault(rel, RFile()).segs.append(s)
         for rf in rem.values():
@@ -710,6 +729,10 @@ class Engine:
         whole = {"b": [], "s": []}
         plan = []
         for key, rf, a, how, extra in self.gets:
+            if not self.inside(self.path_of(key)):
+                log(f"{key}: " + tx("its folder here is a link out of the projects folder — not written",
+                                   "его папка здесь — ссылка за пределы папки проектов — не записываю"))
+                continue
             files = []
             for path, off, cnt, is_whole, ref in self.pieces(key, rf, a, rf.L):
                 if is_whole:

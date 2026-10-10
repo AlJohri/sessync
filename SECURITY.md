@@ -19,6 +19,10 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   and transient so clipboard managers skip them, and clears it at the end.
 - **Local files are owner-only.** Everything sessync writes — downloaded sessions, other Macs'
   prompts, the log, the search index — gets 600/700 permissions, like Claude Code's own files.
+- **Nothing is written outside the projects folder.** Even a Mac that has the password (and so can
+  write anything into the storage) can't make sessync write elsewhere on your other Macs: paths
+  with `..` are skipped, and nothing is written through a link to a folder outside
+  `~/.claude/projects` (subagent links come from the storage as they are).
 - **Your terminal is safe from transcript text.** `sessync find` strips control characters (ESC/OSC
   sequences, BEL, bidi) before printing, so command output or page text stored in a transcript can't
   run in your terminal.

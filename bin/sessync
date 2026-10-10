@@ -8,7 +8,7 @@
 # When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
 # When the last claude closes, the background loop ends by itself.
 set -u
-VERSION=2.0.0
+VERSION=2.0.1
 # Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
 # like Claude Code's own transcripts
 umask 077
@@ -222,6 +222,20 @@ local_key() {
     first="$lh${first#"$rh"}"
   fi
   printf '%s%s\n' "$first" "$rest"
+}
+
+# The path is really under the projects folder: no ".." in it and not through a link to a folder
+# elsewhere (links come from the storage as they are)
+inside_projects() {
+  case "/$1/" in */../*|*/./*) return 1 ;; esac
+  "$PY" -I - "$cfg/projects" "$1" <<'PY'
+import os, sys
+r, d = os.path.realpath(sys.argv[1]), os.path.dirname(sys.argv[2])
+while not os.path.lexists(d):
+    d = os.path.dirname(d)
+d = os.path.realpath(d)
+sys.exit(0 if d == r or d.startswith(r + os.sep) else 1)
+PY
 }
 
 # Claude Code deletes sessions older than cleanupPeriodDays (30 by default) at startup, and the
@@ -816,6 +830,9 @@ print(("  из них дописанные части сессий (хвосты
     n=0
     while IFS= read -r m; do
       day=${m%%/*}; rel=${m#*/projects/}; loc=$(local_key "$rel")
+      if ! inside_projects "$cfg/projects/${loc%.rclonelink}"; then
+        say "Skipped — leads out of the projects folder: $loc" "Пропущено — ведёт за пределы папки проектов: $loc"; continue
+      fi
       if [ -e "$cfg/projects/${loc%.rclonelink}" ] || [ -L "$cfg/projects/${loc%.rclonelink}" ]; then
         say "Already on this Mac: $loc" "Уже есть на этом Mac: $loc"; continue
       fi

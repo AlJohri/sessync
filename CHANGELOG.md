@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.1 — 2026-10-10
+
+- Security: nothing is written outside `~/.claude/projects`. A path from the storage with `..` is
+  skipped, and a file is not written through a link to a folder elsewhere (links arrive from the
+  storage as they are). Writing such things into the storage takes the encryption password, so this
+  closes the way from one compromised Mac to the others. `sessync restore` checks the same.
+
 ## 2.0.0 — 2026-10-10
 
 The tool is now **sessync** and is ready for other people's Macs.
