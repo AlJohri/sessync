@@ -34,6 +34,8 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
   decide.
 - **Search.** `sessync find words` finds the sessions where something was discussed and prints the
   command to continue each one.
+- **Forget a conversation.** `sessync forget` deletes a session on every Mac and in the storage,
+  together with its prompts in the history; for 30 days `sessync restore` brings it back.
 - **Sessions no longer expire after 30 days.** sessync raises Claude Code's retention
   (`cleanupPeriodDays`) to 100 years and brings back from the storage the sessions Claude Code has
   already deleted.
@@ -50,7 +52,7 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 | A truncated copy can overwrite the full one | no, it's a conflict | yes | — | yes |
 | A session continued on two Macs | two sessions, like `/branch`; both in `/resume` | `.conflict` copy | merged into one file | conflict copies |
 | Prompt history | merged line by line | last writer wins | optional | conflict copies |
-| Deletions | 30-day trash, stop on mass deletion, open sessions left alone | deleted at once | mirrored with guards | deleted at once |
+| Deletions | 30-day trash, stop on mass deletion, open sessions left alone; `forget` a session everywhere, with its prompts | deleted at once | mirrored with guards | deleted at once |
 | Encryption | contents and file names | contents | none (encrypt the repo yourself) | on the provider's side |
 | Runs | automatically (Claude Code hooks) | by hand: `push` / `pull` | by hand or from cron | automatically |
 | Search | `sessync find` | — | — | — |
@@ -207,6 +209,9 @@ sessync restore 3bb6f76a    # bring a session back with its attachments (id or p
 sessync                     # the session returns to the storage and your other Macs
 ```
 
+Sessions deleted with `sessync forget` are in the trash too, marked as forgotten; `sessync restore`
+brings back their prompts as well.
+
 Old versions of sessions are not kept separately: a session file is only appended to, so each new
 version contains the previous one whole.
 
@@ -221,30 +226,37 @@ version contains the previous one whole.
 - Delete a whole project: `claude purge <folder>` (a Claude Code command). It is deleted on your
   other Macs too, and a copy stays in the trash for 30 days.
 - Delete one session everywhere — say, one opened for a single quick question: `sessync forget <id>`
-  (the id is in `sessync find`; a unique start of it will do). It asks first; `-y` skips the question.
-  From inside the session itself type `! sessync forget`: it goes once you leave it (`/exit`), and
-  until then it is not synced; `sessync forget --cancel <id>` changes your mind. What goes:
+  (the id is in `sessync find`; its first 8 characters will do if no other session starts with
+  them). It asks first; `-y` skips the question. From inside the session itself type
+  `! sessync forget`: it goes once you leave it (`/exit`), and until then it is not synced;
+  `sessync forget --cancel <id>` changes your mind. What goes:
   - the conversation and its folder (subagents, attachments), here and in the storage;
   - its prompts in the prompt history (↑), with the text pasted into them, also in this Mac's
     history file in the storage;
   - what Claude Code keeps of it outside the projects folder: files and folders named after its id
-    (`session-env`, `file-history`, `todos`, `debug`, `security`) and its temporary folder
+    (such as `session-env`, `file-history`, `todos`, `debug`, `security`) and its temporary folder
     `/tmp/claude-<uid>/<project>/<id>`;
   - its text in the search index.
 
   Your other Macs do the same with their next sync (a session open there goes once it closes). The
   conversation and its prompts wait in the storage trash for 30 days (`TRASH_DAYS`):
-  `sessync restore <id>` brings them back on any Mac, and then the session returns to the other
-  Macs too; after that they are gone for good. Claude Code's own files of it (`/rewind` checkpoints,
-  the temporary folder) don't come back. For a conversation that must leave no copy at all:
-  `sessync forget <id> --now` — no trash, and its earlier copies there go too.
+  `sessync restore <id>` brings them back on any Mac, and then the session returns to the other Macs
+  too; after 30 days they are gone for good. Bring a forgotten session back only with
+  `sessync restore`: its mark stays in the storage for good, even after the trash is cleaned, and
+  while it is there every Mac deletes a file of that session wherever it appears, without the trash
+  — a copy put back by hand or from Time Machine is gone with the next sync. Claude Code's own files
+  of it (`/rewind` checkpoints, the temporary folder) don't come back. For a conversation that must
+  leave no copy at all: `sessync forget <id> --now` — no trash, and its earlier copies there go too.
 
   What stays: the project's `memory/` (each Mac has its own), its branches "… (Branch)" — separate
-  sessions, forget them by their own ids — and what reached Anthropic during the conversation. Its
-  prompts in the history file of a Mac that no longer syncs stay in the storage, encrypted: only that
-  Mac rewrites its file, and no Mac shows them.
-- Delete one session keeping a copy in the trash for 30 days: delete the `<id>.jsonl` file and the
-  `<id>/` folder next to it (subagents and attachments).
+  sessions, forget them by their own ids — what reached Anthropic during the conversation, copies
+  in your backups (Time Machine), and old versions at the provider if your bucket keeps them
+  (versioning; Backblaze B2 keeps all versions unless its lifecycle is "keep only the last
+  version"). Its prompts in the history file of a Mac that no longer syncs stay in the storage,
+  encrypted: only that Mac rewrites its file, and no Mac shows them.
+- By hand: delete the `<id>.jsonl` file and the `<id>/` folder next to it (subagents and
+  attachments). The deletion reaches your other Macs and the trash keeps a copy for 30 days, but its
+  prompts in the history and Claude Code's files of it stay.
 
 ## Security
 
@@ -277,7 +289,7 @@ in [SECURITY.md](SECURITY.md).
 | `settings.json can't be read` | `~/.claude/settings.json` has an error; `jq . ~/.claude/settings.json` shows where |
 | `did not finish (code …)` | usually the network; sessync retries by itself, details in `sessync log` |
 | `stopped: too many deletions` | `sessync deletes` shows what was deleted and where; by mistake — `--undo`, on purpose — `--apply` |
-| `the storage is in a newer format` | another Mac runs a newer sessync: update this one |
+| `the storage is in a newer format` | another Mac runs a newer sessync: update this one (3.0 raised the format, so every Mac needs 3.0 or newer) |
 | `sessions ↻ …` in yellow | no sync for a while: check `sessync status`, maybe there's no network |
 
 The log is `~/.local/state/sessync/sync.log`.
@@ -342,8 +354,8 @@ sessions deleted again.
 - **Forgetting** (`sessync forget`). Once the session is closed, the Mac puts a mark with its id into
   the storage and moves the session and its prompts to the trash; every Mac that meets the mark
   deletes its own copy and takes its prompts out of the history, and doesn't send or receive that
-  session while the mark is there. `sessync restore` takes the mark away. With `--now` it is the one
-  deletion without the trash.
+  session while the mark is there; the mark stays for good. `sessync restore` takes it away. With
+  `--now` it is the one deletion without the trash.
 - **Prompt history.** Each Mac has its own file in the storage (Mac name plus the start of its
   hardware UUID) and only that Mac writes it, appending its new prompts; the others only receive it.
   On each Mac all these files are merged line by line, without repeats. When `sessync forget` takes
@@ -352,8 +364,9 @@ sessions deleted again.
 - **Format.** The storage format is recorded in a check file. When the format is newer than the
   installed version knows, that version stops instead of writing the old way. Format 3 came with
   `sessync forget`: a 2.x version would bring forgotten prompts back, so it stops.
-- **Files on this Mac:** state in `~/.local/state/sessync/` (log, status-line marks, engine state),
-  settings in `~/.config/sessync/config`, search index in `~/.cache/sessync/find`.
+- **Files on this Mac:** state in `~/.local/state/sessync/` (log, status-line marks, engine state,
+  sessions waiting to be forgotten), settings in `~/.config/sessync/config`, search index in
+  `~/.cache/sessync/find`.
 - **Tests** — `tests/run.sh`: several "Macs" and a local folder instead of the storage; they don't
   touch the Keychain, the clipboard or the real `~/.claude`.
 

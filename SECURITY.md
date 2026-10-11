@@ -18,7 +18,9 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   export` puts them into the clipboard of this Mac only (no Universal Clipboard), marked as concealed
   and transient so clipboard managers skip them, and clears it at the end.
 - **Local files are owner-only.** Everything sessync writes — downloaded sessions, other Macs'
-  prompts, the log, the search index — gets 600/700 permissions, like Claude Code's own files.
+  prompts, the log, the search index — gets 600/700 permissions, like Claude Code's own files. The
+  copies of session text that a sync stages on the way to and from the storage are deleted when the
+  sync ends.
 - **Nothing is written outside the projects folder.** Even a Mac that has the password (and so can
   write anything into the storage) can't make sessync write elsewhere on your other Macs: paths
   with `..` are skipped, and nothing is written through a link to a folder outside
@@ -27,8 +29,9 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   sequences, BEL, bidi) before printing, so command output or page text stored in a transcript can't
   run in your terminal. Session titles shown by `sessync conflicts` are cleaned the same way, and
   notifications pass their text to `osascript` as an argument, never as part of the script.
-- **Mistakes are recoverable.** Deleted sessions stay in the trash for 30 days; a mass deletion
-  stops the sync until you decide; a truncated transcript never overwrites a full one.
+- **Mistakes are recoverable.** Deleted sessions stay in the trash for 30 days, also the ones
+  deleted everywhere with `sessync forget` (unless you add `--now`); a mass deletion stops the sync
+  until you decide; a truncated transcript never overwrites a full one.
 
 ## What the storage can see
 
@@ -36,6 +39,8 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   when you work and how much.
 - The folder nesting (names are encrypted, the depth is not), and the name of the check file
   `v1-check/keycheck` (its contents are encrypted).
+- That a session was deleted with `sessync forget`, and when: a small object whose name (the
+  session id) is encrypted stays as a mark, so the other Macs delete it too.
 
 ## What sessync doesn't protect against
 
@@ -46,6 +51,18 @@ sometimes API keys from a `.env`. sessync is built so that the storage never see
   `password2`), so the password is the only secret.
 - Losing the encryption password. Nobody — not the provider, not this project — can read the data
   without it. Save it with `sessync export` or in your password manager.
+
+## Deleting a conversation for good
+
+`sessync forget <id> --now` deletes a session and its prompts from this Mac, the storage and its
+trash, and from your other Macs as they sync (see the README). What no tool on your Mac can delete:
+
+- what reached Anthropic during the conversation — it is kept under Anthropic's policies;
+- copies in your backups, such as Time Machine;
+- old versions at the provider, if the bucket keeps them: turn object versioning off, and on
+  Backblaze B2 set the bucket's lifecycle to "keep only the last version" (by default B2 keeps all
+  versions of a deleted file). These versions are encrypted like everything else;
+- a Mac that is offline: it deletes its copy when it syncs next.
 
 ## Storage keys
 
