@@ -35,23 +35,32 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    use the engine's `resync` mode (union only, deletes nothing): otherwise Claude Code's own cleanup
    at startup would reach the storage and the other Macs; this way the deleted sessions come back.
    The mass-deletion guard (`--max-delete`, 50%) is never switched off; `apply` mode only through
-   `sessync deletes --apply`. What is deleted on this Mac is first copied to `ss:trash/<date>/`
-   (the base and all tails), then deleted; no copy — no deletion. Deletions in the storage are
-   first saved to `pending` in the engine state, then done: an interrupted run finishes them. Only
-   deleted files go to the trash, never old versions. `clean_trash` deletes folders older than
-   `TRASH_DAYS` once a day. Other Macs' tails may be deleted only when their data is kept in
-   another form: folding or a new base (the same text), or a conflict where the other version is
-   kept as a branch session or a copy (only a continuation of Claude Code's service lines — no user
-   or assistant message — may go: it is not worth a branch). Under a new base, off-chain tails go
-   too: the file only grows (shorter is always a conflict), so a tail starting inside the base can
-   never attach again, and its data is with the Mac that sent it. Own off-chain tails are garbage
-   only after the file was settled in this run.
+   `sessync deletes --apply`. What is deleted on this Mac is first copied to `ss:trash/<date>/` (the
+   base and all tails), then deleted; no copy — no deletion. `sessync forget` (one session, by its
+   id or `! sessync forget` typed by the user in it; confirmed or `-y` otherwise; only once it is
+   closed) puts a mark into the storage (`forgotten/<id>`) before anything of it is deleted there;
+   its files go to the trash, its prompts too (`trash/<date>/history/<id>/<Mac>.jsonl`), and every
+   Mac drops its copy and its prompts. Nothing of it is sent or received while the mark is there
+   (resync and `deletes --undo` don't bring it back); only `sessync restore` takes the mark out,
+   before putting the files back. `--now` is the one exception to the trash: the user asks for no
+   copy, so its objects go at once and its copies in the trash too. On this Mac the local mark
+   (`$st/forget/<id>`) is written before anything is deleted; `--cancel` only while nothing is.
+   Deletions in the storage are first saved to `pending` in the engine state, then done: an
+   interrupted run finishes them. Only deleted files go to the trash, never old versions.
+   `clean_trash` deletes folders older than `TRASH_DAYS` once a day. Other Macs' tails may be
+   deleted only when their data is kept in another form: folding or a new base (the same text), or a
+   conflict where the other version is kept as a branch session or a copy (only a continuation of
+   Claude Code's service lines — no user or assistant message — may go: it is not worth a branch).
+   Under a new base, off-chain tails go too: the file only grows (shorter is always a conflict), so
+   a tail starting inside the base can never attach again, and its data is with the Mac that sent
+   it. Own off-chain tails are garbage only after the file was settled in this run.
 3. **Storage format.** crypt parameters and the layout — `v1/` (`projects/`, `history/`,
-   `seg/<tree>/<file path>/<tail>`, `trash/<date>/…`), `v1-check/keycheck`. The check file's first
-   line (`cc-sync key check v1`, from the tool's old name) never changes; the second is the format
+   `seg/<tree>/<file path>/<tail>`, `trash/<date>/…` (`history/<id>/<Mac>.jsonl` — prompts of a
+   forgotten session), `forgotten/<session id>`), `v1-check/keycheck`. The check file's first line
+   (`cc-sync key check v1`, from the tool's old name) never changes; the second is the format
    (`FORMAT`), the third — the storage's home folder (`home /Users/…`). A tail is named
-   `<start:016d>-<end:016d>-<level>-<signature:12>-<Mac>`. Changing the layout or names means raising
-   `FORMAT` and a migration: old data must stay readable, old versions must stop.
+   `<start:016d>-<end:016d>-<level>-<signature:12>-<Mac>`. Changing the layout or names means
+   raising `FORMAT` and a migration: old data must stay readable, old versions must stop.
 4. **Transcripts are only appended to** — tails, signatures of the last 4 KB and the search index
    by offset all depend on it. The engine sends a rewritten file whole only if it got longer and the
    storage didn't change; otherwise it's a conflict. Only whole lines are sent. The home-folder
@@ -63,25 +72,33 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    fields: time, epoch, sent, received, seconds, kind; only the last may be empty). Machine checks
    use marks, not texts (`deletes-stop`). Changing them — update `statusline`, both READMEs, and say
    so in CHANGELOG.
-6. **Background only while `claude` is open**: SessionStart/SessionEnd hooks and `_loop`, which
-   ends by itself when there is no `claude` process. No launchd, cron or login items. The state is
+6. **Background only while `claude` is open**: SessionStart/SessionEnd hooks and `_loop`, which ends
+   by itself when there is no `claude` process. No launchd, cron or login items. The state is
    visible (`status`, `statusline`), there is a switch (`off`/`on`). The lock is `lock`; whoever
    doesn't get it leaves `again`, and the holder (`sync_all`) runs once more: otherwise the tail of
    a session closed during a long upload would wait for the next run. Each Mac's prompt history is
    `ss:history/<host_id>.jsonl` (name + start of the hardware UUID: Mac names can be the same), only
-   appended with its own new prompts (locally — `history/<host_id>.jsonl` in the state folder).
-   Compaction is done only by the Mac that appended last.
+   appended with its own new prompts (locally — `history/<host_id>.jsonl` in the state folder);
+   `sessync forget` is the only rewrite: the Mac takes a forgotten session's lines out and sends the
+   file whole. So other Macs' files are only received (`--own`), and their storage version replaces
+   the copy here; format 3 stops the 2.x versions that would upload the old copy back. A forgotten
+   session's lines in the file of a Mac that no longer syncs stay there, encrypted; every Mac
+   filters them out (`forgotten-all`). Compaction is done only by the Mac that appended last.
+   `host_id` needs `scutil` and `ioreg` from `/usr/sbin`, which hooks don't have in `PATH` —
+   `sessync` adds it.
 7. **Transcripts are other people's data.** Everything created on disk is owner-only (`umask 077`
    in `sessync`, `os.umask(0o077)` in the engine and find, `chmod 700` of the index), like Claude
-   Code's own files (700/600). Any text from transcripts goes through `clean()` before reaching the
+   Code's own files (700/600). The engine's work folder holds copies of what travels and is removed
+   when each run ends. Any text from transcripts goes through `clean()` before reaching the
    terminal (strips Cc and Cf: ESC/OSC, BEL, bidi), or command output and page text would run in it.
 8. **Two languages.** Every message a person sees — `t`/`say` in bash, `tx` in python — has English
    and Russian. Log formats parsed by code stay as they are (`too many deletes (>50%, X of N) on
    PathN`). Tests read Russian (`SESSYNC_LANG=ru`), one section checks English.
 9. **bash 3.2** (`/bin/bash` on macOS): no associative arrays, `${v,,}`, `mapfile`, `&>>`; an empty
-   array under `set -u` only as `${a[@]+"${a[@]}"}`. **python 3.9** (`/usr/bin/python3`): no `match`,
-   no `X | Y` in types, no nanoseconds in `fromisoformat`; argparse values starting with `-` only as
-   `--opt=value`.
+   array under `set -u` only as `${a[@]+"${a[@]}"}`; a variable right before a non-ASCII character
+   only in braces (`«${title}»`: bash 3.2 takes the bytes of `»` into the name). **python 3.9**
+   (`/usr/bin/python3`): no `match`, no `X | Y` in types, no nanoseconds in `fromisoformat`;
+   argparse values starting with `-` only as `--opt=value`.
 10. **macOS only for now**: Keychain, `osascript`, `scutil`, `ioreg`. Keep new code portable (no
     `stat -f`, `date -j`), Linux is next.
 11. **The file of a session open on this Mac is not changed** (`opened`: sessync's own list

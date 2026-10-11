@@ -42,6 +42,17 @@ What is deleted on this Mac is first copied to the trash (inside the storage), t
 than --max-delete percent of deletions stop the sync until the user decides (like bisync
 --max-delete, with the same log line).
 
+sessync forget: a session asked for here (--forget DIR/<id>) gets a mark in the storage
+(--tombs REMOTE/<id>) once it is closed, and then on every Mac its files are deleted here, and its
+objects in the storage go to the trash — sessync restore brings it back until the trash is cleaned;
+it is never sent or received again while the mark is there. Asked for with "now" in DIR/<id>: the
+one deletion without the trash — the objects go at once, and its copies in the trash too. While it
+is open on a Mac, nothing of it changes there.
+
+Prompt history (--own KEY, this Mac's file): each Mac writes only its own file, so the others' are
+only received, and their storage version replaces the copy here — also a shorter one, when sessync
+forget took lines out of it on its Mac. This Mac's own file, rewritten here, goes whole.
+
 --map=REMOTE:LOCAL: on a Mac with another user name, project folders (the first path component,
 named after the absolute path by Claude Code) under the storage's home prefix REMOTE are LOCAL here.
 
@@ -49,6 +60,10 @@ named after the absolute path by Claude Code) under the storage's home prefix RE
   engine.py ahead BASES TAILS HISTORY FILE STATE --key=KEY --host MAC
                                       claude -r: has another Mac written lines of this session?
   engine.py fetch BASE TAILS FILE     assemble a transcript from a base and tails (trash restore)
+  engine.py opened SESSION            exit code 0 — the session is open in claude here
+  engine.py describe ID --projects DIR       sessync forget: which session that is
+  engine.py forget-local SESSION --config DIR …   sessync forget: everything of it on this Mac
+  engine.py put-prompts FILE… --config DIR …      sessync restore: its prompts back
 
 sync prints "sent received bytes-sent bytes-received"; exit code 3 — stopped because of deletions,
 1 — error. Log messages are in English, or Russian with SESSYNC_LANG=ru.
@@ -231,6 +246,14 @@ def session_of(rel):
     if len(parts) == 2 and parts[1].endswith(".jsonl"):
         return parts[1][:-6]
     return parts[1] if len(parts) > 2 else None
+
+
+def sid_of(key):
+    """The session a file belongs to, for sessync forget: <project>/<id>.jsonl, its conflict copies
+    and its link, everything in <project>/<id>/."""
+    parts = key.split("/")
+    name = parts[1].split(".", 1)[0] if len(parts) > 1 else ""
+    return name if UUID_RE.match(name) else None
 
 
 def open_sessions(d):
@@ -488,6 +511,8 @@ class Engine:
         self.del_remote, self.del_local, self.insync = [], [], set()
         self.rem, self.opened = {}, set()
         self.held, self.forks = {}, []   # open sessions waiting for another Mac's lines; new branches
+        self.tombs, self.forgot, self.forget_here, self.forget_there = set(), [], [], []   # sessync forget
+        self.now = set()
 
     def save(self):
         tmp = self.a.state + ".sessync.tmp"
@@ -739,6 +764,9 @@ class Engine:
 
     # ---- decisions per file -------------------------------------------------------------------
     def plan_log(self, key, st, l, rf, opened):
+        if self.a.own and key != self.a.own:
+            self.plan_theirs(key, st, l, rf)
+            return
         mode, deletes = self.a.mode, not self.a.no_deletes
         path = self.path_of(key)
         rexists = rf is not None and rf.base is not None
@@ -803,13 +831,42 @@ class Engine:
                         self.incoming(key, rf, c)
                 else:
                     self.conflicts.append((key, path, l, rf, s))
-        elif not lv and rv and rf.L == s and complete_end(path, l.size, 0) > rf.L:
+        elif not lv and rv and rf.L == s and (complete_end(path, l.size, 0) > rf.L or key == self.a.own):
             # rewritten here and longer now, unchanged in the storage — send it whole.
-            # Shorter is damage rather than an edit: a conflict, and the longer version stays the main one
+            # Shorter is damage rather than an edit: a conflict, and the longer version stays the main one.
+            # This Mac's own prompt history is the exception: only this Mac writes it, and sessync forget
+            # takes lines out of it
             log(f"{key}: " + tx("rewritten on this Mac — sending it whole", "файл переписан на этом Mac — отправляю целиком"))
             self.puts.append((key, path, ("base", 0, complete_end(path, l.size, 0)), l, self.chain_drop(key, rf)))
         else:
             self.conflicts.append((key, path, l, rf, 0))
+
+    def plan_theirs(self, key, st, l, rf):
+        """Another Mac's prompt history: only that Mac writes it, so here it is only received, and the
+        storage's version is the right one — also when it got shorter (sessync forget took lines out)."""
+        if rf is None or rf.base is None:
+            return  # nothing to receive; a copy here stays as it is
+        if l is None:
+            self.get(key, rf, 0, "new")
+            return
+        path = self.path_of(key)
+        if st is None:  # the copy here is the start of the storage's file — or not, then it is replaced
+            c = l.size
+            if c <= rf.L and (c == 0 or self.same_at(key, path, rf, c)):
+                st = self.files[key] = self.logstate(c, file_sig(path, c), -1, -1,
+                                                     [rf.base[0], rf.base[1]] if c == rf.base[0] else None)
+            else:
+                self.get(key, rf, 0, "replace")
+                return
+        s = st["s"]
+        if l.size == s and self.local_valid(path, st, l) and self.remote_valid(key, st, rf):
+            if rf.L == s:
+                st.update(size=l.size, mtime=l.mtime)
+                self.insync.add(key)
+            else:
+                self.get(key, rf, s, "append")
+        else:
+            self.get(key, rf, 0, "replace")
 
     def plan_whole(self, key, kind, st, l, rf, opened):
         """Attachments and links: change only whole — like bisync with --compare size."""
@@ -874,8 +931,15 @@ class Engine:
 
     # ---- sync ---------------------------------------------------------------------------------
     def run(self):
+        """The work folder holds copies of what travels — the text of sessions: gone when the run ends."""
         shutil.rmtree(self.work, ignore_errors=True)
         os.makedirs(self.work)
+        try:
+            return self.sync()
+        finally:
+            shutil.rmtree(self.work, ignore_errors=True)
+
+    def sync(self):
         self.flush_pending()
         if self.a.wait_closed:  # from the hook of a session that is closing: claude exits right after it
             t0 = time.time()
@@ -885,9 +949,15 @@ class Engine:
         rem = self.rem = self.remote()
         opened = self.opened = self.open_now() | set(self.a.open)
         known = len(self.files)
+        forget = self.forget_marks(opened)
 
         for key in sorted(set(loc) | set(rem) | set(self.files)):
             st, l, rf = self.files.get(key), loc.get(key), rem.get(key)
+            sid = sid_of(key)
+            if sid in forget:
+                if sid not in opened:  # while it is open, nothing of it changes, nothing is sent
+                    self.forget_key(key, sid, l, rf)
+                continue
             if l is None and (rf is None or rf.base is None):
                 self.files.pop(key, None)
                 self.insync.add(key)
@@ -926,6 +996,7 @@ class Engine:
         self.do_gets()
         self.do_puts()
         self.do_deletes(rem)
+        self.do_forget(rem)
         # own tails left out of the chain (a losing branch, leftovers of folding) are garbage
         for key in self.insync:
             rf = rem.get(key)
@@ -934,6 +1005,13 @@ class Engine:
                     self.pending.append(["s", f"{key}/{s.name}"])
         self.save()
         self.flush_pending()
+        for sid, kind in self.forgot:
+            if kind == "mark":
+                log(tx("forgotten: ", "сессия забыта: ") + sid + tx(" — in the trash until it is cleaned (sessync restore)",
+                                                                    " — в корзине, пока её не очистят (sessync restore)"))
+            elif kind == "now":
+                log(tx("forgotten for good: ", "сессия забыта насовсем: ") + sid
+                    + tx(" — here, in the storage and in its trash", " — здесь, в хранилище и в его корзине"))
         self.outputs()
         print(self.up, self.down, self.bup, self.bdown)
         return 0
@@ -942,13 +1020,98 @@ class Engine:
         """Sessions open in claude on this Mac: Claude Code's registry and sessync's own hooks."""
         return open_sessions(self.a.sessions) | own_open(self.a.own_open)
 
+    # ---- sessync forget -----------------------------------------------------------------------
+    def forget_marks(self, opened):
+        """Sessions to forget: asked for on this Mac (--forget DIR/<id>) and forgotten on any Mac (a
+        mark in --tombs, the storage). A session asked for here gets its mark in the storage once it
+        is closed, before anything of it is deleted: an interrupted run is finished by any Mac."""
+        if not self.a.tombs:
+            return set()
+        try:
+            asked = {n for n in os.listdir(self.a.forget) if UUID_RE.match(n)} if self.a.forget else set()
+        except FileNotFoundError:
+            asked = set()
+        for sid in asked:
+            with open(os.path.join(self.a.forget, sid), encoding="utf-8") as f:
+                if "now" in f.read().split():
+                    self.now.add(sid)
+        self.tombs = {it["Path"] for it in listing(self.a.tombs) if UUID_RE.match(it["Path"])}
+        new = sorted(asked - self.tombs - opened)
+        if new:
+            d = os.path.join(self.work, "tombs")
+            os.makedirs(d)
+            for sid in new:
+                with open(os.path.join(d, sid), "w", encoding="utf-8") as f:
+                    f.write(f"{self.host} {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n")
+            rclone("copy", d, self.a.tombs, "--no-check-dest")
+            self.tombs.update(new)
+        self.forgot = [(sid, "now" if sid in self.now else "mark" if sid in asked else "tomb")
+                       for sid in sorted((asked | self.tombs) - opened)]
+        return asked | self.tombs
+
+    def forget_key(self, key, sid, l, rf):
+        """A file of a forgotten session: deleted here, its objects in the storage go to the trash —
+        or at once, asked for "now" here. Never sent, never received."""
+        if l is not None:
+            self.forget_here.append(key)
+        if rf is not None and sid in self.now:
+            if rf.base is not None:
+                self.pending.append(["b", key])
+            self.pending.extend(["s", f"{key}/{s.name}"] for s in rf.segs)
+        elif rf is not None:
+            self.forget_there.append(key)
+        self.files.pop(key, None)
+
+    def do_forget(self, rem):
+        if self.forget_there:
+            self.to_trash(self.forget_there, rem)
+            log(tx("forgotten sessions (sessync forget), to the trash and out of the storage: ",
+                   "забытые сессии (sessync forget), в корзину и из хранилища: ")
+                + str(len(self.forget_there)) + tx(" files", " файлов"))
+        n = 0
+        for key in self.forget_here:
+            path = self.path_of(key)
+            try:
+                os.unlink(path)
+                n += 1
+            except FileNotFoundError:
+                pass
+            # empty folders of the session (<id>/subagents/) go with it
+            d, top = os.path.dirname(path), os.path.join(self.root, key.split("/")[0])
+            while d != top and d.startswith(top + os.sep):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
+                d = os.path.dirname(d)
+        now = [sid for sid, kind in self.forgot if kind == "now"]
+        if now and self.a.trash:
+            # "now": its copies in the trash of every day go too — the base, the tails, the session's
+            # folder, its prompts
+            inc = []
+            for sid in now:
+                inc += ["--include", f"/*/projects/*/{sid}.*", "--include", f"/*/projects/*/{sid}/**",
+                        "--include", f"/*/seg/projects/*/{sid}.*/**", "--include", f"/*/seg/projects/*/{sid}/**",
+                        "--include", f"/*/history/{sid}/**"]
+            rclone("delete", self.a.trash.rsplit("/", 1)[0], *inc, "--fast-list")
+        if n or now:
+            self.save()
+        if n:
+            log(tx("forgotten sessions (sessync forget), deleted here: ",
+                   "забытые сессии (sessync forget), удалено здесь: ") + str(n) + tx(" files", " файлов"))
+
     def outputs(self):
         """For sessync: open sessions that wait for another Mac's lines (id, that Mac), new branches
-        (id, title)."""
-        for path, rows in ((self.a.held_out, self.held.items()), (self.a.forks_out, self.forks)):
+        (id, title), forgotten sessions settled here (id, mark or now — asked for here, tomb — on
+        another Mac), all the forgotten ones (id)."""
+        for path, rows in ((self.a.held_out, self.held.items()), (self.a.forks_out, self.forks),
+                           (self.a.forgot_out, self.forgot)):
             if path:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("".join(f"{x}\t{y}\n" for x, y in rows))
+        if self.a.forgotten_out and self.a.tombs:
+            with open(self.a.forgotten_out, "w", encoding="utf-8") as f:
+                f.write("".join(sid + "\n" for sid in sorted(self.tombs)))
 
     def do_gets(self):
         if not self.gets:
@@ -1174,6 +1337,13 @@ class Engine:
             if when:
                 os.utime(path, (time.time(), when))
             self.files[key] = self.logstate(L, file_sig(path, L), L, os.stat(path).st_mtime_ns, base)
+        elif how == "replace":  # another Mac's prompt history: the storage's version takes the copy's place
+            tmp = path + ".sessync.tmp"
+            clone_prefix(delta, tmp, L)
+            os.replace(tmp, path)
+            if when:
+                os.utime(path, (time.time(), when))
+            self.files[key] = self.logstate(L, file_sig(path, L), L, os.stat(path).st_mtime_ns, base)
         elif how == "conflict-remote":
             # shorter here: this version becomes a copy next to it, the storage version takes the main name
             copy = self.conflict_name(path)
@@ -1300,26 +1470,29 @@ class Engine:
                     + (tx(" into a new base", " в новую основу") if what[0] == "base" else ""))
         self.save()
 
+    def to_trash(self, keys, rem):
+        """First a copy to the trash inside the storage (no download), then the deletion: the bases
+        and all the tails, saved in pending before they are deleted."""
+        if not self.a.trash:
+            raise Fail(tx("deletion without a trash", "удаление без корзины"))
+        bases = [k for k in keys if rem[k].base is not None]
+        segs = [f"{k}/{x.name}" for k in keys for x in rem[k].segs]
+        for root, dst, names, kind in ((self.rbase, f"{self.a.trash}/{self.a.tree}", bases, "b"),
+                                       (self.rseg, f"{self.a.trash}/seg/{self.a.tree}", segs, "s")):
+            if names:
+                lst = os.path.join(self.work, f"trash-{kind}.txt")
+                with open(lst, "w", encoding="utf-8") as f:
+                    f.write("\n".join(names) + "\n")
+                rclone("copy", root, dst, "--files-from-raw", lst, "--no-traverse")
+        for k in keys:
+            self.files.pop(k, None)
+        self.pending.extend(["b", k] for k in bases)
+        self.pending.extend(["s", x] for x in segs)
+        self.save()
+
     def do_deletes(self, rem):
         if self.del_remote:
-            if not self.a.trash:
-                raise Fail(tx("deletion without a trash", "удаление без корзины"))
-            # first a copy to the trash inside the storage (no download), then the deletion
-            segs = [f"{k}/{x.name}" for k in self.del_remote for x in rem[k].segs]
-            b = os.path.join(self.work, "trash-b.txt")
-            with open(b, "w", encoding="utf-8") as f:
-                f.write("\n".join(self.del_remote) + "\n")
-            rclone("copy", self.rbase, f"{self.a.trash}/{self.a.tree}", "--files-from-raw", b, "--no-traverse")
-            if segs:
-                s = os.path.join(self.work, "trash-s.txt")
-                with open(s, "w", encoding="utf-8") as f:
-                    f.write("\n".join(segs) + "\n")
-                rclone("copy", self.rseg, f"{self.a.trash}/seg/{self.a.tree}", "--files-from-raw", s, "--no-traverse")
-            for k in self.del_remote:
-                self.pending.append(["b", k])
-                self.files.pop(k, None)
-            self.pending.extend(["s", x] for x in segs)
-            self.save()
+            self.to_trash(self.del_remote, rem)
             log(tx("to the trash and out of the storage: ", "в корзину и из хранилища: ") + str(len(self.del_remote)) + tx(" files deleted on this Mac", " файлов, удалённых на этом Mac"))
         for k in self.del_local:
             try:
@@ -1437,6 +1610,209 @@ def cmd_fetch(base, segdir, out):
         os.unlink(tmp)
 
 
+def cmd_describe(ident, projects):
+    """sessync forget: the sessions here whose id starts with ident — id, folder, last change, title.
+    A whole id that isn't here is printed alone: the session may be in the storage only."""
+    if not re.fullmatch(r"[0-9a-f-]{8,36}", ident):
+        return 1
+    rows = []
+    try:
+        folders = sorted(os.listdir(projects))
+    except OSError:
+        folders = []
+    for proj in folders:
+        d = os.path.join(projects, proj)
+        if os.path.islink(d) or not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            sid = fn[:-6]
+            if fn.endswith(".jsonl") and sid.startswith(ident) and UUID_RE.match(sid):
+                p = os.path.join(d, fn)
+                st = os.lstat(p)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                end = complete_end(p, st.st_size, 0)
+                rows.append((sid, clean(proj), time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+                             title_of([(p, 0, end)], end, sid) if end else ""))
+    if not rows and UUID_RE.match(ident):
+        rows.append((ident, "", "", ""))
+    for r in rows:
+        print("\t".join(x.replace("\t", " ") for x in r))
+    return 0
+
+
+def project_to(line, a, b):
+    """A prompt history line with its project folder under home a moved under home b (bytes)."""
+    a, b = a.rstrip("/"), b.rstrip("/")
+    if a == b or b'"' + a.encode() not in line:
+        return line
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return line
+    p = d.get("project") if isinstance(d, dict) else None
+    if isinstance(p, str) and (p == a or p.startswith(a + "/")):
+        d["project"] = b + p[len(a):]
+        return (json.dumps(d, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return line
+
+
+def drop_lines(path, sids):
+    """Lines of these sessions ("sessionId") out of a prompt history file. Only whole lines; the file
+    is read again right before it is replaced, so a prompt written meanwhile is kept. Returns the
+    dropped lines."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    for _ in range(5):
+        whole = data[:data.rfind(b"\n") + 1]
+        keep, gone = [], []
+        for line in whole.splitlines(True):
+            if b'"sessionId"' in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    d = None
+                if isinstance(d, dict) and d.get("sessionId") in sids:
+                    gone.append(line)
+                    continue
+            keep.append(line)
+        if not gone:
+            return []
+        with open(path, "rb") as f:
+            data = f.read()
+        if data.startswith(whole):  # Claude Code only appends: what it added meanwhile stays
+            tmp = path + ".sessync.tmp"
+            with open(tmp, "wb") as f:
+                f.write(b"".join(keep) + data[len(whole):])
+            shutil.copymode(path, tmp)
+            os.replace(tmp, path)
+            return gone
+    raise Fail(tx("the file keeps changing: ", "файл всё время меняется: ") + path)
+
+
+def cmd_forget_local(a):
+    """sessync forget, on this Mac: the session's files in the projects folder, what Claude Code keeps
+    for it elsewhere (files and folders named after its id: session-env, file-history, todos, debug,
+    security, its temporary folder), its prompts in the prompt history (and the pasted text they
+    alone refer to), its lines in this Mac's own history file for the storage, its text in the
+    search index. The session must be closed. --keep FILE: its prompts are appended there first, with
+    the project folders under the storage's home (--home here, --canon there), for sessync restore.
+    Prints how many files and prompts went."""
+    sid = a.sid
+    if not UUID_RE.match(sid):
+        return 1
+    n = 0
+
+    def rm(p):
+        nonlocal n
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                for _, _, fns in os.walk(p):
+                    n += len(fns)
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+                n += 1
+        except FileNotFoundError:
+            pass
+
+    def dirs(root):
+        """Folders right inside root — not links: nothing is deleted through a link elsewhere."""
+        try:
+            with os.scandir(root) as it:
+                return [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return []
+
+    cfg = a.config
+    projects = os.path.join(cfg, "projects")
+    for d in dirs(projects):
+        for fn in os.listdir(d):
+            if fn == sid or fn.startswith(sid + "."):   # <id>.jsonl, its copies and link, the <id>/ folder
+                rm(os.path.join(d, fn))
+    for d in dirs(cfg):
+        if os.path.basename(d) in ("projects", "plugins"):
+            continue
+        for fn in os.listdir(d):
+            if sid in fn:
+                rm(os.path.join(d, fn))
+    if a.tmp:
+        for d in dirs(a.tmp):
+            rm(os.path.join(d, sid))
+    if a.cache:
+        for d in dirs(os.path.join(a.cache, "text")):
+            rm(os.path.join(d, sid + ".txt"))
+    hist = os.path.realpath(os.path.join(cfg, "history.jsonl"))
+    gone = drop_lines(hist, {sid})
+    if a.keep and gone:
+        with open(a.keep, "ab") as f:
+            f.write(b"".join(project_to(x, a.home or "", a.canon or "") for x in gone))
+    hashes = set()
+    for line in gone:
+        try:
+            for v in (json.loads(line).get("pastedContents") or {}).values():
+                h = v.get("contentHash") if isinstance(v, dict) else None
+                if isinstance(h, str) and re.fullmatch(r"[0-9a-f]{8,64}", h):
+                    hashes.add(h)
+        except (ValueError, AttributeError):
+            pass
+    if hashes:
+        try:
+            with open(hist, "rb") as f:
+                rest = f.read()
+        except FileNotFoundError:
+            rest = b""
+        for h in hashes:
+            if f'"{h}"'.encode() not in rest:
+                rm(os.path.join(cfg, "paste-cache", h + ".txt"))
+    if a.history_dir and a.own:
+        drop_lines(os.path.join(a.history_dir, a.own), {sid})
+    print(n, len(gone))
+    log(tx(f"forgotten here: {sid} — files {n}, prompts {len(gone)}",
+           f"забыта здесь: {sid} — файлов {n}, промптов {len(gone)}"))
+    return 0
+
+
+def cmd_put_prompts(a):
+    """sessync restore: a forgotten session's prompts back into the prompt history — without repeats,
+    all by time, project folders from under the storage's home (--canon) to under this one (--home).
+    Prints how many came back."""
+    hist = os.path.realpath(os.path.join(a.config, "history.jsonl"))
+    new = []
+    for p in a.files:
+        with open(p, "rb") as f:
+            new += [project_to(x if x.endswith(b"\n") else x + b"\n", a.canon, a.home)
+                    for x in f.read().splitlines(True) if x.strip()]
+    try:
+        with open(hist, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        data = b""
+    have = set(data.splitlines(True))
+    new = [x for x in dict.fromkeys(new) if x not in have]
+    if new:
+        def ts(x):
+            try:
+                return float(json.loads(x).get("timestamp") or 0)
+            except (ValueError, AttributeError, TypeError):
+                return 0.0
+        whole = data[:data.rfind(b"\n") + 1]
+        lines = sorted(whole.splitlines(True) + new, key=ts)
+        with open(hist, "rb") as f:
+            now = f.read()
+        tmp = hist + ".sessync.tmp"
+        with open(tmp, "wb") as f:   # what Claude Code appended meanwhile stays at the end
+            f.write(b"".join(lines) + (now[len(whole):] if now.startswith(whole) else b""))
+        if os.path.exists(hist):
+            shutil.copymode(hist, tmp)
+        os.replace(tmp, hist)
+    print(len(new))
+    return 0
+
+
 def main():
     global LOG
     os.umask(0o077)
@@ -1460,6 +1836,11 @@ def main():
     s.add_argument("--held-out")
     s.add_argument("--forks-out")
     s.add_argument("--own-open", metavar="DIR")
+    s.add_argument("--forget", metavar="DIR")      # sessions to forget, asked for here: DIR/<session id>
+    s.add_argument("--tombs", metavar="REMOTE")    # forgotten sessions, marks in the storage: REMOTE/<session id>
+    s.add_argument("--forgot-out")
+    s.add_argument("--forgotten-out")
+    s.add_argument("--own", metavar="KEY")         # prompt history: this Mac's file; the others' are only received
     s.add_argument("--log")
     k = sub.add_parser("ahead")
     for name in ("base", "seg", "history", "file", "state"):
@@ -1472,9 +1853,36 @@ def main():
     for name in ("base", "segdir", "out"):
         f.add_argument(name)
     f.add_argument("--log")
+    o = sub.add_parser("opened")   # exit code 0 — the session is open in claude on this Mac
+    o.add_argument("sid")
+    o.add_argument("--sessions")
+    o.add_argument("--own-open", metavar="DIR")
+    o.add_argument("--log")
+    d = sub.add_parser("describe")
+    d.add_argument("ident")
+    d.add_argument("--projects", required=True)
+    d.add_argument("--log")
+    g = sub.add_parser("forget-local")
+    g.add_argument("sid")
+    g.add_argument("--config", required=True)
+    g.add_argument("--history-dir")
+    g.add_argument("--own")
+    g.add_argument("--cache")
+    g.add_argument("--tmp")
+    g.add_argument("--keep")
+    g.add_argument("--home")
+    g.add_argument("--canon")
+    g.add_argument("--log")
+    r = sub.add_parser("put-prompts")
+    r.add_argument("files", nargs="+")
+    r.add_argument("--config", required=True)
+    r.add_argument("--home", required=True)
+    r.add_argument("--canon", required=True)
+    r.add_argument("--log")
     a = ap.parse_args()
     if not a.cmd:
-        ap.error(tx("a command is needed: sync, ahead or fetch", "нужна команда: sync, ahead или fetch"))
+        ap.error(tx("a command is needed: sync, ahead, fetch, opened, describe, forget-local or put-prompts",
+                    "нужна команда: sync, ahead, fetch, opened, describe, forget-local или put-prompts"))
     LOG = a.log
     try:
         if a.cmd == "fetch":
@@ -1482,6 +1890,14 @@ def main():
             return 0
         if a.cmd == "ahead":
             return cmd_ahead(a)
+        if a.cmd == "opened":
+            return 0 if a.sid in open_sessions(a.sessions) | own_open(a.own_open) else 1
+        if a.cmd == "describe":
+            return cmd_describe(a.ident, a.projects)
+        if a.cmd == "forget-local":
+            return cmd_forget_local(a)
+        if a.cmd == "put-prompts":
+            return cmd_put_prompts(a)
         os.makedirs(os.path.dirname(a.state), exist_ok=True)
         return Engine(a).run()
     except (Fail, OSError) as e:

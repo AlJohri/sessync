@@ -8,7 +8,7 @@
 # When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
 # When the last claude closes, the background loop ends by itself.
 set -u
-VERSION=2.1.1
+VERSION=3.0.0
 # Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
 # like Claude Code's own transcripts
 umask 077
@@ -24,9 +24,13 @@ while [ -L "$_p" ]; do _l=$(readlink "$_p"); case $_l in /*) _p=$_l ;; *) _p="$(
 LIB="$(cd "$(dirname "$_p")/.." && pwd -P)/lib"
 CHECK_TEXT="cc-sync key check v1"   # never changes: every version compares the first line
 # Storage format — second line of the check file. 2: transcripts are a base plus appended tails.
-# A newer format stops older versions instead of letting them write the old way
-FORMAT=2
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"   # hooks and the loop start without a profile
+# 3: sessync forget — marks of forgotten sessions (forgotten/<id>), and another Mac's prompt history
+# follows its storage version even when it got shorter. A newer format stops older versions instead
+# of letting them write the old way (a 2.x version would bring forgotten lines back)
+FORMAT=3
+# Hooks and the loop start without a profile; /usr/sbin — scutil and ioreg for host_id: without them
+# this Mac's history file would get a second name
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 PY=${SESSYNC_PYTHON:-python3}   # python 3.9 or newer; the tests also run /usr/bin/python3
 
 STORAGE="" PROVIDER=Other ENDPOINT="" REGION="" BUCKET="" REMOTE="" INTERVAL=600
@@ -311,10 +315,20 @@ merge_history() {
   if [ ! -f "$st/engine/history.json" ]; then
     rclone copy ss:history "$hd" --size-only 2>>"$st/run.log" || return 1
   fi
-  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" <<'PY' || return 1
+  # Forgotten sessions (sessync forget): their prompts are never sent, and leave this Mac's own file.
+  # Asked for here but still open: not sent, but kept until the session closes (forget --cancel)
+  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" "$st/forgotten-all" "$st/forget" <<'PY' || return 1
 import glob, json, os, sys
-local, hd, me, canon, home = sys.argv[1:6]
+local, hd, me, canon, home, gone_f, hold_d = sys.argv[1:8]
 canon, home = canon.rstrip("/"), home.rstrip("/")
+def sid(l):
+    if '"sessionId"' not in l:
+        return None
+    try:
+        d = json.loads(l)
+    except ValueError:
+        return None
+    return d.get("sessionId") if isinstance(d, dict) else None
 def conv(l, a, b):
     if a == b or ('"' + a) not in l:
         return l
@@ -333,6 +347,19 @@ def lines(p):
             return [l.rstrip("\n") for l in f if l.strip()]
     except FileNotFoundError:
         return []
+gone = set(lines(gone_f))
+try:
+    hold = set(os.listdir(hold_d))
+except OSError:
+    hold = set()
+own = os.path.join(hd, me + ".jsonl")
+if gone:
+    have = lines(own)
+    keep = [l for l in have if sid(l) not in gone]
+    if len(keep) < len(have):
+        with open(own + ".sessync.tmp", "w", encoding="utf-8") as f:
+            f.write("".join(l + "\n" for l in keep))
+        os.replace(own + ".sessync.tmp", own)
 known = set()
 for p in glob.glob(os.path.join(hd, "*.jsonl")):
     known.update(lines(p))
@@ -342,8 +369,7 @@ try:  # whole lines only: Claude Code may be writing the last one right now
 except FileNotFoundError:
     data = ""
 mine = [conv(l, home, canon) for l in data[:data.rfind("\n") + 1].split("\n") if l.strip()]
-new = [l for l in dict.fromkeys(mine) if l not in known]
-own = os.path.join(hd, me + ".jsonl")
+new = [l for l in dict.fromkeys(mine) if l not in known and sid(l) not in gone | hold]
 if new:
     with open(own, "ab") as f:
         if f.tell():
@@ -356,13 +382,23 @@ elif not os.path.exists(own):
     open(own, "a").close()
 PY
   engine sync history "$hd" ss:history ss:seg/history "$st/engine/history.json" --host "$HOST" \
-    --work "$st/engine/work-history" --no-deletes --log "$st/run.log" >/dev/null 2>>"$st/run.log" || return 1
-  # Other Macs' lines join this Mac's (no repeats), all by time. The file is read again right before
-  # it is replaced, so a prompt an open session wrote meanwhile is not lost
-  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" <<'PY' || return 1
+    --work "$st/engine/work-history" --no-deletes --own "$HOST.jsonl" --log "$st/run.log" \
+    >/dev/null 2>>"$st/run.log" || return 1
+  # Other Macs' lines join this Mac's (no repeats), all by time; forgotten sessions' prompts go. The
+  # file is read again right before it is replaced, so a prompt an open session wrote meanwhile is
+  # not lost
+  "$PY" -I - "$cfg/history.jsonl" "$hd" "$HOST" "$HOME_CANON" "$HOME" "$st/forgotten-all" <<'PY' || return 1
 import glob, json, os, sys
-local, hd, me, canon, home = sys.argv[1:6]
+local, hd, me, canon, home, gone_f = sys.argv[1:7]
 canon, home = canon.rstrip("/"), home.rstrip("/")
+def sid(l):
+    if '"sessionId"' not in l:
+        return None
+    try:
+        d = json.loads(l)
+    except ValueError:
+        return None
+    return d.get("sessionId") if isinstance(d, dict) else None
 def conv(l, a, b):
     if a == b or ('"' + a) not in l:
         return l
@@ -381,27 +417,31 @@ def lines(p):
             return [l.rstrip("\n") for l in f if l.strip()]
     except FileNotFoundError:
         return []
-have = set(lines(local))
+gone = set(lines(gone_f))
+here = lines(local)
+have = set(here)
+drop = bool(gone) and any(sid(l) in gone for l in here)
 extra = []
 for p in sorted(glob.glob(os.path.join(hd, "*.jsonl"))):
     if os.path.basename(p) == me + ".jsonl":
         continue
     for l in lines(p):
         l = conv(l, canon, home)
-        if l not in have:
+        if l not in have and sid(l) not in gone:
             have.add(l)
             extra.append(l)
-if extra:
+if extra or drop:
     def ts(l):
         try:
             return float(json.loads(l).get("timestamp") or 0)
         except Exception:
             return 0.0
-    merged = list(dict.fromkeys(lines(local) + extra))
-    merged.sort(key=ts)
+    merged = [l for l in dict.fromkeys(lines(local) + extra) if sid(l) not in gone]
+    if extra:
+        merged.sort(key=ts)
     tmp = local + ".sessync.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(merged) + "\n")
+        f.write("".join(l + "\n" for l in merged))
     os.replace(tmp, local)
 PY
 }
@@ -430,20 +470,80 @@ clean_trash() {
   today > "$st/trash-cleaned"
 }
 
+# sessync forget. Asked for with a mark, $st/forget/<id> ("now" in it — for good at once). The sync
+# run that finds the session closed puts a mark into the storage (forgotten/<id>), deletes its files
+# here and moves its objects in the storage to the trash (the engine); every other Mac deletes its
+# copy when it meets the mark. What else of it is on a Mac — Claude Code's files outside the projects
+# folder, its prompts, its text in the search index — goes in forget_local; its prompts go to the
+# trash too (trash/<date>/history/<id>/<Mac>.jsonl), so sessync restore brings back the conversation
+# and its prompts until the trash is cleaned (TRASH_DAYS). "now": nothing goes to the trash, and its
+# copies there are deleted
+CLAUDE_TMP=${SESSYNC_CLAUDE_TMP:-/tmp/claude-$(id -u)}   # Claude Code's temporary folders
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+# $1 — session id (closed); $2 — log (the main one by default); $3 — a file to keep its prompts in,
+# for the trash. Prints "files prompts"
+forget_local() {
+  local out log=${2:-$logf}
+  out=$(engine forget-local "$1" --config "$cfg" --history-dir "$st/history" --own "$(host_id).jsonl" \
+    --cache "${XDG_CACHE_HOME:-$HOME/.cache}/sessync/find" --tmp "$CLAUDE_TMP" \
+    ${3:+--keep "$3" --home "$HOME" --canon "$(canon_home)"} --log "$log" 2>>"$log") || return 1
+  rm -f "$st/open/$1"
+  printf '%s\n' "$out"
+}
+
+# After the engine: forgotten sessions closed here (id, kind). Asked for here (mark, now): every time,
+# then its mark goes; a mark — its prompts go to the trash first. Forgotten on another Mac (tomb):
+# once. A session whose mark left the storage (sessync restore) is no longer counted as forgotten
+forget_settle() {
+  local sid kind keep
+  mkdir -p "$st/forgot-prompts"
+  while IFS=$'\t' read -r sid kind; do
+    [[ $sid =~ $UUID_RE ]] || continue
+    [ "$kind" = tomb ] && grep -qx "$sid" "$st/forgotten" 2>/dev/null && continue
+    keep=""
+    [ "$kind" = mark ] && keep="$st/forgot-prompts/$sid.jsonl"
+    forget_local "$sid" "$st/run.log" "$keep" >/dev/null || continue
+    if [ -s "$keep" ]; then
+      rclone copyto "$keep" "ss:trash/$(today)/history/$sid/$HOST.jsonl" 2>>"$st/run.log" || continue
+    fi
+    [ -n "$keep" ] && rm -f "$keep"
+    grep -qx "$sid" "$st/forgotten" 2>/dev/null || echo "$sid" >> "$st/forgotten"
+    [ "$kind" = tomb ] || rm -f "$st/forget/$sid"
+  done < "$st/forgot-run"
+  if [ -f "$st/forgotten" ]; then
+    grep -Fx -f "$st/forgotten-all" "$st/forgotten" > "$st/forgotten.tmp" 2>/dev/null
+    mv -f "$st/forgotten.tmp" "$st/forgotten"
+  fi
+}
+
+session_open() {  # $1 — session id: open in claude on this Mac (Claude Code's registry, sessync's list)
+  engine opened "$1" --sessions "$cfg/sessions" --own-open "$st/open"
+}
+
+# The sync lock. $1 — wait for a running sync (2 min at most), or one try
+take_lock() {
+  local i
+  find "$st/lock" -maxdepth 0 -mmin +120 -exec rmdir {} \; 2>/dev/null
+  mkdir "$st/lock" 2>/dev/null && return 0
+  [ -n "${1:-}" ] || return 1
+  for i in $(seq 1 240); do
+    sleep 0.5
+    mkdir "$st/lock" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 sync_once() {
   mkdir -p "$st"
   chmod 700 "$st"
   if [ -f "$st/off" ]; then say "Automatic sync is off: sessync on" "Автосинхронизация выключена: sessync on"; return 0; fi
-  find "$st/lock" -maxdepth 0 -mmin +120 -exec rmdir {} \; 2>/dev/null
-  local i got=""
-  mkdir "$st/lock" 2>/dev/null && got=1
+  local got=""
+  take_lock && got=1
   if [ -z "$got" ] && [ -n "${SESSYNC_WAIT_LOCK:-}" ]; then
     # By hand, or claude -r: the result is needed now — wait for the running sync (2 min at most)
     [ -t 1 ] && say "Waiting for the running sync to finish…" "Жду, пока закончится текущая синхронизация…"
-    for i in $(seq 1 240); do
-      sleep 0.5
-      mkdir "$st/lock" 2>/dev/null && { got=1; break; }
-    done
+    take_lock wait && got=1
   fi
   if [ -z "$got" ]; then
     # The running sync may have listed the files before this session wrote its last lines (a big
@@ -481,7 +581,7 @@ sync_locked() {
   check_key || return 1
   # Storages have no folders, so this does nothing there; the local "storage" of the tests needs them
   local d
-  for d in projects history seg/projects seg/history; do rclone mkdir "ss:$d" 2>/dev/null; done
+  for d in projects history seg/projects seg/history trash forgotten; do rclone mkdir "ss:$d" 2>/dev/null; done
   HOST=$(host_id)
 
   # Keep the log small: the last ~5 MB
@@ -501,6 +601,7 @@ sync_locked() {
   : > "$st/deleted.txt"
   : > "$st/held"
   : > "$st/forks-run"
+  : > "$st/forgot-run"
   # SESSYNC_OPEN_SID — the session claude -r has just opened (it may not be registered yet);
   # SESSYNC_CLOSING_SID — the one whose claude is exiting: wait for it, then its file is free
   local t0 open=()
@@ -511,9 +612,11 @@ sync_locked() {
     --host "$HOST" --work "$st/engine/work-projects" --mode "$mode" --skip-memory \
     --trash "ss:trash/$(today)" --sessions "$cfg/sessions" --deleted-out "$st/deleted.txt" \
     --held-out "$st/held" --forks-out "$st/forks-run" --own-open "$st/open" ${open[@]+"${open[@]}"} \
+    --forget "$st/forget" --tombs ss:forgotten --forgot-out "$st/forgot-run" --forgotten-out "$st/forgotten-all" \
     ${map[@]+"${map[@]}"} --log "$st/run.log" 2>>"$st/run.log"); rc=$?
   local up=0 down=0 bup=0 bdown=0 hist_ok=1
   [ $rc -eq 0 ] && read -r up down bup bdown <<<"$res"
+  [ $rc -eq 0 ] && forget_settle
   merge_history || hist_ok=""
   cat "$st/run.log" >> "$logf"
 
@@ -689,7 +792,10 @@ sessync — сессии Claude Code на всех ваших Mac, через в
   sessync off | on     выключить / включить автоматическую синхронизацию
   sessync conflicts    сессии, которые на двух Mac пошли по-разному, и копии (--delete — удалить копии)
   sessync trash        удалённые сессии в корзине хранилища (хранятся 30 дн., TRASH_DAYS)
-  sessync restore ID   вернуть сессию из корзины (id или часть пути)
+  sessync restore ID   вернуть сессию из корзины (id или часть пути), забытую — с её промптами
+  sessync forget ID    удалить сессию здесь, в хранилище и на других Mac вместе с её промптами;
+                       30 дн. её можно вернуть (restore), --now — сразу насовсем;
+                       ! sessync forget внутри сессии — её саму, после выхода
   sessync deletes      если синхронизация остановилась из-за массового удаления: --undo / --apply
   sessync setup        хранилище, ключи и пароль шифрования (в своём терминале)
   sessync export       по шагам сохранить ключи и пароль в «Пароли» — для других Mac
@@ -707,7 +813,10 @@ sessync — Claude Code sessions on all your Macs, through storage you own, encr
   sessync off | on     turn automatic sync off / on
   sessync conflicts    sessions that went two ways on two Macs, and copies (--delete deletes the copies)
   sessync trash        deleted sessions in the storage trash (kept 30 days, TRASH_DAYS)
-  sessync restore ID   bring a session back from the trash (id or part of the path)
+  sessync restore ID   bring a session back from the trash (id or part of the path), with its prompts
+  sessync forget ID    delete a session here, in the storage and on your other Macs, with its prompts;
+                       for 30 days restore brings it back, --now — for good at once;
+                       ! sessync forget inside a session — that one, once you leave it
   sessync deletes      sync stopped because of a mass deletion: --undo / --apply
   sessync setup        storage, keys and the encryption password (in your own terminal)
   sessync export       save keys and password to the Passwords app, step by step — for other Macs
@@ -777,7 +886,6 @@ case "${1:-now}" in
     exit $rc ;;
 
   hook)  # from Claude Code hooks: don't hold the session; print nothing but the warning of resume_check
-    [ -f "$st/off" ] && exit 0
     sid="" src="" tp="" why=""
     if [ ! -t 0 ] && command -v jq >/dev/null; then   # the hook's input: {"session_id", "source", …}
       input=$(head -c 65536)
@@ -787,10 +895,7 @@ case "${1:-now}" in
       case $sid in *[!A-Za-z0-9-]*) sid="" ;; esac
       case $tp in *..*) tp="" ;; esac
     fi
-    if [ "${2:-}" = start ] && [ -z "$TEST_REMOTE" ] && ! loop_alive; then
-      nohup "$self" _loop >/dev/null 2>&1 &
-    fi
-    if [ -n "$sid" ]; then   # sessync's own list of open sessions
+    if [ -n "$sid" ]; then   # sessync's own list of open sessions, kept also while sync is off
       mkdir -p "$st/open"
       if [ "${2:-}" = start ] && cpid=$(claude_pid); then
         grep -lx "$cpid" "$st/open"/* 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done   # its previous session
@@ -798,6 +903,16 @@ case "${1:-now}" in
       elif [ "${2:-}" = end ] && [ "$why" = clear ]; then
         rm -f "$st/open/$sid"   # /clear: the same claude goes on with a new session
       fi                        # otherwise the entry goes when its claude exits
+    fi
+    if [ -f "$st/off" ]; then
+      # sync is off, but a session asked to be forgotten still goes from this Mac once claude exits
+      if [ "${2:-}" = end ] && [ -n "$sid" ] && [ -f "$st/forget/$sid" ]; then
+        nohup "$self" _forget_closed "$sid" >/dev/null 2>&1 &
+      fi
+      exit 0
+    fi
+    if [ "${2:-}" = start ] && [ -z "$TEST_REMOTE" ] && ! loop_alive; then
+      nohup "$self" _loop >/dev/null 2>&1 &
     fi
     if [ "${2:-}" = start ] && [ "$src" = resume ] && [ -n "$sid" ]; then
       resume_check "$sid" "$tp"
@@ -808,6 +923,134 @@ case "${1:-now}" in
     exit 0 ;;
 
   _run) sync_all >/dev/null 2>&1 ;;
+
+  _forget_closed)  # from the end hook while sync is off: once claude has exited, it goes from this Mac
+    sid=${2:-}
+    [[ $sid =~ $UUID_RE ]] && [ -f "$st/forget/$sid" ] || exit 0
+    for i in $(seq 1 60); do
+      session_open "$sid" || break
+      sleep 0.5
+    done
+    session_open "$sid" && exit 0   # still open: the next sync, once it is closed
+    take_lock wait || exit 1
+    trap 'rmdir "$st/lock" 2>/dev/null' EXIT
+    mkdir -p "$st/forgot-prompts"
+    forget_local "$sid" "" "$st/forgot-prompts/$sid.jsonl" >/dev/null ;;
+
+  forget)  # a session: here, in the storage, on the other Macs, its prompts; in the trash until it is cleaned
+    shift; yes="" cancel="" now="" ident=""
+    for a in "$@"; do
+      case $a in
+        -y|--yes) yes=1 ;;
+        --cancel) cancel=1 ;;
+        --now) now=1 ;;
+        -*) say "Unknown option: $a (sessync help)" "Неизвестный ключ: $a (sessync help)"; exit 1 ;;
+        *) ident=$a ;;
+      esac
+    done
+    cur=""   # no id: the session this command runs in (! sessync forget inside Claude Code)
+    if [ -z "$ident" ]; then
+      cur=1 ident=${CLAUDE_CODE_SESSION_ID:-}
+      # or by the claude process it runs under, in sessync's own list of open sessions (the hooks)
+      if [ -z "$ident" ] && cpid=$(claude_pid); then
+        ident=$(grep -lx "$cpid" "$st/open"/* 2>/dev/null | head -1)
+        ident=${ident##*/}
+      fi
+    fi
+    if [ -z "$ident" ]; then
+      say "Which session: sessync forget <id> (find it: sessync find). Inside the session itself: ! sessync forget" \
+        "Какую сессию: sessync forget <id> (найти — sessync find). Внутри самой сессии: ! sessync forget"
+      exit 1
+    fi
+    if ! [[ $ident =~ ^[0-9a-f-]{8,36}$ ]]; then say "Not a session id: $ident" "Это не id сессии: $ident"; exit 1; fi
+    rows=$(engine describe "$ident" --projects "$cfg/projects")
+    if [ -n "$cancel" ]; then
+      # Only while nothing of it is deleted yet: its file is here and its mark is not in the storage
+      sid=$(ls "$st/forget" 2>/dev/null | grep -E "$UUID_RE" | grep "^$ident")
+      if [ "$(printf '%s' "$sid" | grep -c .)" -ne 1 ]; then
+        say "Nothing to undo: this session is not waiting to be forgotten (gone already? sessync restore)" \
+          "Отменять нечего: эта сессия не ждёт удаления (уже удалена? sessync restore)"
+        exit 1
+      fi
+      if ! printf '%s\n' "$rows" | grep -q "^$sid"$'\t'"[^"$'\t'"]" \
+        || { load_env 2>/dev/null && rclone lsf ss:forgotten 2>/dev/null | grep -qx "$sid"; }; then
+        say "Too late to undo: it is being deleted. Once the next sync is done — sessync restore $sid" \
+          "Отменить уже нельзя: она удаляется. После ближайшей синхронизации — sessync restore $sid"
+        exit 1
+      fi
+      rm -f "$st/forget/$sid"
+      say "Undone: session $sid stays" "Отменено: сессия $sid остаётся"
+      exit 0
+    fi
+    n=$(printf '%s' "$rows" | grep -c .)
+    if [ "$n" -eq 0 ]; then say "No such session here: $ident (sessync find)" "Такой сессии здесь нет: $ident (sessync find)"; exit 1; fi
+    if [ "$n" -gt 1 ]; then
+      say "Several sessions start with $ident — give more of the id:" "С $ident начинается несколько сессий — укажите id длиннее:"
+      printf '%s\n' "$rows" | awk -F'\t' '{ printf "  %s  %s  %s\n", $1, $3, $4 }'
+      exit 1
+    fi
+    IFS=$'\t' read -r sid proj when title <<<"$rows"
+    if [ -n "$proj" ]; then
+      say "Session «${title}» — ${proj}, last change ${when}" "Сессия «${title}» — ${proj}, последнее изменение ${when}"
+    elif [ -z "$cur" ]; then
+      say "Session $sid is not on this Mac — it goes from the storage and your other Macs" \
+        "Сессии $sid на этом Mac нет — удалю её из хранилища и с других Mac"
+    fi
+    # The user's own ! sessync forget in a session goes without a question: it waits for /exit, can be
+    # undone till then and restored after. By id, or for good: confirmed, or -y
+    if [ -z "$yes" ] && { [ -z "$cur" ] || [ -n "$now" ]; }; then
+      if [ -t 0 ]; then
+        if [ -n "$now" ]; then
+          read -rp "$(t "Delete it for good, with no way back — here, in the storage, on your other Macs, with its prompts? [y/N] " \
+            "Удалить её насовсем, без возврата — здесь, в хранилище, на других Mac, вместе с её промптами? [y/N] ")" v
+        else
+          read -rp "$(t "Delete it — here, in the storage, on your other Macs, with its prompts? For $TRASH_DAYS days sessync restore brings it back [y/N] " \
+            "Удалить её — здесь, в хранилище, на других Mac, вместе с её промптами? $TRASH_DAYS дн. её можно вернуть: sessync restore [y/N] ")" v
+        fi
+        case $v in [yYдД]*) ;; *) say "Not deleted" "Не удалено"; exit 1 ;; esac
+      else
+        say "Confirm: sessync forget $sid${now:+ --now} -y" "Подтвердите: sessync forget $sid${now:+ --now} -y"
+        exit 1
+      fi
+    fi
+    mkdir -p "$st/forget" "$st/forgot-prompts"
+    printf '%s%s\n' "$(date '+%F %T')" "${now:+ now}" > "$st/forget/$sid"
+    if [ "$sid" = "${CLAUDE_CODE_SESSION_ID:-}" ] || session_open "$sid"; then
+      say "The session is open: it goes once you leave it (/exit), and until then it is not synced. Undo: sessync forget --cancel $sid" \
+        "Сессия открыта: удалю её, когда вы из неё выйдете (/exit), а до тех пор она не синхронизируется. Отменить: sessync forget --cancel $sid"
+      exit 0
+    fi
+    keep="$st/forgot-prompts/$sid.jsonl"
+    [ -n "$now" ] && keep=""
+    if [ -f "$st/off" ]; then
+      take_lock wait || { say "A sync is running — try again in a couple of minutes" "Идёт синхронизация — повторите через пару минут"; exit 1; }
+      trap 'rmdir "$st/lock" 2>/dev/null' EXIT
+      forget_local "$sid" "" "$keep" >/dev/null
+      say "Deleted on this Mac. Sync is off: from the storage and your other Macs it goes with the next sync (sessync on)." \
+        "Удалена на этом Mac. Синхронизация выключена: из хранилища и с других Mac удалю при следующей синхронизации (sessync on)."
+      exit 0
+    fi
+    SESSYNC_WAIT_LOCK=1 sync_all; rc=$?
+    if [ ! -f "$st/forget/$sid" ]; then
+      if [ -n "$now" ]; then
+        say "Done: deleted for good — here, in the storage and in its trash. Your other Macs delete it with their next sync." \
+          "Готово: удалена насовсем — здесь, в хранилище и в его корзине. Другие Mac удалят её при своей следующей синхронизации."
+      else
+        say "Done: deleted here and in the storage; your other Macs delete it with their next sync. For $TRASH_DAYS days it can be brought back: sessync restore $sid" \
+          "Готово: удалена здесь и в хранилище, другие Mac удалят её при своей следующей синхронизации. $TRASH_DAYS дн. её можно вернуть: sessync restore $sid"
+      fi
+      exit 0
+    fi
+    # The mark is written before anything is deleted, so a sync that sees the files gone sees it too
+    if take_lock; then
+      trap 'rmdir "$st/lock" 2>/dev/null' EXIT
+      forget_local "$sid" "" "$keep" >/dev/null
+      say "Deleted on this Mac; from the storage it goes with the next sync." "Удалена на этом Mac; из хранилища удалю при следующей синхронизации."
+    else
+      say "It goes with the next sync." "Удалю её при следующей синхронизации."
+    fi
+    report $rc
+    exit 0 ;;
 
   _loop)
     mkdir -p "$st"
@@ -842,6 +1085,9 @@ case "${1:-now}" in
       say "Last session that went two ways: ${when:0:16} «${title}» — sessync conflicts" \
         "Последняя разошедшаяся сессия: ${when:0:16} «${title}» — sessync conflicts"
     fi
+    n=$(ls "$st/forget" 2>/dev/null | grep -cE "$UUID_RE")
+    [ "$n" -gt 0 ] && say "Waiting to be forgotten (sessync forget): $n — once closed, with the next sync" \
+      "Ждут удаления (sessync forget): $n — после закрытия, при ближайшей синхронизации"
     retention_ok || say "Session retention (cleanupPeriodDays) is under 10 years — the next sync fixes it (sessync)" \
       "Срок хранения сессий (cleanupPeriodDays) меньше 10 лет — исправит ближайшая синхронизация (sessync)"
     if [ "$(enc "$(canon_home)")" != "$(enc "$HOME")" ]; then
@@ -922,18 +1168,38 @@ print(("  из них дописанные части сессий (хвосты
       END { for (k in seen) printf "%s\t%d\n", k, size[k] }' | sort -r)
     if [ -z "$out" ]; then say "The trash is empty" "Корзина пуста"; exit 0; fi
     say "Deleted sessions and files (kept $TRASH_DAYS days from the deletion):" "Удалённые сессии и файлы (хранятся $TRASH_DAYS дн. с даты удаления):"
-    printf '%s\n' "$out" | awk -F'\t' -v w="$(t deleted удалено)" -v u="$(t KB КБ)" '{ printf "  %s %s  %s  (%d %s)\n", w, $1, $2, ($3 + 1023) / 1024, u }'
+    rclone lsf ss:forgotten > "$st/trash-tombs" 2>/dev/null
+    printf '%s\n' "$out" | awk -F'\t' -v w="$(t deleted удалено)" -v u="$(t KB КБ)" -v f="$(t "forgotten (sessync forget)" "забыта (sessync forget)")" \
+      -v tombs="$st/trash-tombs" 'BEGIN { while ((getline x < tombs) > 0) gone[x] = 1 }
+      { id = $2; sub(/^[^\/]*\//, "", id); sub(/[.\/].*/, "", id)
+        printf "  %s %s  %s  (%d %s)%s\n", w, $1, $2, ($3 + 1023) / 1024, u, (id in gone) ? " — " f : "" }'
     say "Restore: sessync restore <session id or part of the path>" "Вернуть: sessync restore <id сессии или часть пути>" ;;
 
   restore)
     [ -n "${2:-}" ] || { say "What to restore: sessync restore <session id or part of the path> (list: sessync trash)" \
       "Что вернуть: sessync restore <id сессии или часть пути> (список — sessync trash)"; exit 1; }
     load_env || { say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; exit 1; }
+    rclone lsf -R --files-only ss:trash > "$st/trash.txt" 2>/dev/null
     # For each path — the latest copy: later dates first
-    rclone lsf -R --files-only ss:trash 2>/dev/null | grep '^[^/]*/projects/' | grep -F -- "$2" | sort -r \
+    grep '^[^/]*/projects/' "$st/trash.txt" | grep -F -- "$2" | sort -r \
       | awk '{ p = $0; sub(/^[^\/]*\/projects\//, "", p); if (!(p in seen)) { seen[p] = 1; print } }' \
       > "$st/restore.txt"
     if [ ! -s "$st/restore.txt" ]; then say "Not in the trash: $2 (list: sessync trash)" "В корзине нет: $2 (список — sessync trash)"; exit 1; fi
+    # A forgotten session (sessync forget): its mark leaves the storage first — or the next sync would
+    # delete it again — and it is no longer forgotten here
+    sids=$(sed 's|^[^/]*/projects/[^/]*/||; s|[./].*||' "$st/restore.txt" | grep -E "$UUID_RE" | sort -u)
+    tombs=$(rclone lsf ss:forgotten 2>/dev/null)
+    for sid in $sids; do
+      printf '%s\n' "$tombs" | grep -qx "$sid" || continue
+      if ! rclone deletefile "ss:forgotten/$sid" 2>>"$logf"; then
+        say "Could not take its mark out of the storage — try again (sessync log)" "Не удалось убрать её метку из хранилища — повторите (sessync log)"
+        exit 1
+      fi
+      rm -f "$st/forget/$sid"
+      for f in forgotten forgotten-all; do
+        [ -f "$st/$f" ] && { grep -vx "$sid" "$st/$f" > "$st/$f.tmp"; mv -f "$st/$f.tmp" "$st/$f"; }
+      done
+    done
     n=0
     while IFS= read -r m; do
       day=${m%%/*}; rel=${m#*/projects/}; loc=$(local_key "$rel")
@@ -960,6 +1226,20 @@ print(("  из них дописанные части сессий (хвосты
         say "Could not restore: $loc (sessync log)" "Не удалось вернуть: $loc (sessync log)"
       fi
     done < "$st/restore.txt"
+    # Prompts of a forgotten session, kept in the trash by each Mac that had them
+    for sid in $sids; do
+      d="$st/restore-prompts"
+      rm -rf "$d"; mkdir -p "$d"
+      i=0
+      grep "^[^/]*/history/$sid/" "$st/trash.txt" | while IFS= read -r m; do
+        i=$((i + 1)); rclone copyto "ss:trash/$m" "$d/$i.jsonl" 2>>"$logf"
+      done
+      if ls "$d"/*.jsonl >/dev/null 2>&1; then
+        k=$(engine put-prompts "$d"/*.jsonl --config "$cfg" --home "$HOME" --canon "$(canon_home)" --log "$logf" 2>>"$logf")
+        [ "${k:-0}" -gt 0 ] && say "Its prompts are back in the history: $k" "Её промпты вернулись в историю: $k"
+      fi
+      rm -rf "$d"
+    done
     [ "$n" -gt 0 ] && say "It returns to the storage and your other Macs with the next sync (sessync)." \
       "В хранилище и на другие Mac вернётся при следующей синхронизации (sessync)."
     exit 0 ;;

@@ -12,6 +12,8 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/sessync-test.XXXXXX")
 export SESSYNC_TEST_REMOTE="$T/s3" SESSYNC_LANG=ru
 export SESSYNC_TEST_S3_ACCESS_KEY=test SESSYNC_TEST_S3_SECRET_KEY=test
 export SESSYNC_TEST_PASSPHRASE=correct-horse-battery-staple
+export SESSYNC_CLAUDE_TMP="$T/claude-tmp"   # sessync forget: Claude Code's temporary folders
+unset CLAUDE_CODE_SESSION_ID                 # run from inside Claude Code: not its session
 # rclone storage: tests must not read the real ~/.config/rclone/rclone.conf
 export RCLONE_CONFIG="$T/rclone-user.conf"; : > "$RCLONE_CONFIG"
 mkdir -p "$T/s3/bucket"
@@ -496,6 +498,179 @@ run P now >/dev/null
 check "переустановка: свой файл истории продолжается, без конфликта" test -z "$(find "$T/P/state/sessync/history" -name '*.conflict*')"
 check "переустановка: промпты не задвоились" test "$(grep -c 'новый промпт P' "$T/P/history.jsonl")" = 1
 
+echo "== sessync forget: везде и с промптами, TRASH_DAYS — в корзине, restore возвращает; --now — насовсем"
+mkdir -p "$T/s3/bucket9"
+for m in FA FB; do mac $m; setconf $m bucket9; done
+G1=aaaaaaaa-1111-4111-8111-111111111111   # забываем закрытую
+G2=aaaaaaaa-2222-4222-8222-222222222222   # остаётся
+G3=bbbbbbbb-3333-4333-8333-333333333333   # есть только в корзине
+G4=cccccccc-4444-4444-8444-444444444444   # открыта на FA
+G5=dddddddd-5555-4555-8555-555555555555   # текущая: ! sessync forget, потом хук конца
+G6=eeeeeeee-6666-4666-8666-666666666666   # FB дописал её, ещё не зная
+G7=ffffffff-7777-4777-8777-777777777777   # синхронизация выключена
+G8=abababab-8888-4888-8888-888888888888   # передумали
+G9=cdcdcdcd-9999-4999-8999-999999999999   # выключена и открыта: уходит после выхода
+G11=fefefefe-1111-4111-8111-111111111111  # --now
+G12=dcdcdcdc-1212-4212-8212-121212121212  # срок корзины истёк
+f9=$T/FA/projects/-tmp-f
+hl() {  # hl A session prompt [hash] — промпт в истории A (hash — вставленный текст в paste-cache)
+  local pasted=""
+  [ -n "${4:-}" ] && pasted="\"1\":{\"id\":1,\"type\":\"text\",\"contentHash\":\"$4\"}"
+  printf '{"display":"%s","pastedContents":{%s},"timestamp":%s000,"project":"/tmp/f","sessionId":"%s"}\n' \
+    "$3" "$pasted" "$(date +%s)" "$2" >> "$T/$1/history.jsonl"
+}
+inbucket() { at FA "rclone lsf -R --files-only ss:projects; rclone lsf -R --files-only ss:seg/projects" | grep -q "$1"; }
+intrash() { at FA "rclone lsf -R --files-only ss:trash" | grep -q "$1"; }
+opn() { mkdir -p "$T/$1/sessions"; printf '{"pid":%s,"sessionId":"%s"}\n' $$ "$2" > "$T/$1/sessions/$2.json"; }
+cls() { rm -f "$T/$1/sessions/$2.json"; }
+say FA -tmp-f $G1 "секретная разовая переписка"
+say FA "-tmp-f/$G1/subagents" agent-1 "субагент секретной"
+say FA -tmp-f $G2 "обычная переписка"
+hl FA $G1 "секретный вопрос" 0123456789abcdef
+hl FA $G2 "обычный вопрос"
+mkdir -p "$T/FA/paste-cache" "$T/FA/session-env/$G1" "$T/FA/file-history/$G1" "$T/FA/security" "$T/claude-tmp/-tmp-f/$G1"
+echo "вставленный секрет" > "$T/FA/paste-cache/0123456789abcdef.txt"
+echo v1 > "$T/FA/file-history/$G1/v1"; echo '{}' > "$T/FA/security/security_warnings_state_$G1.json"
+echo страница > "$T/claude-tmp/-tmp-f/$G1/page.html"
+run FA now >/dev/null; run FB now >/dev/null
+check "FB получил сессию и её промпт" sh -c "test -f '$T/FB/projects/-tmp-f/$G1.jsonl' && grep -q 'секретный вопрос' '$T/FB/history.jsonl'"
+ss FA find секретная >/dev/null   # индекс поиска с её текстом
+check "без id и не в сессии: спрашивает, какую" has FA 'Какую сессию' forget
+check "не id: отказ" has FA 'не id сессии' forget 'zz;rm'
+check "начало id у двух сессий: просит длиннее" has FA 'несколько сессий' forget aaaaaaaa -y
+check "без терминала и без -y: просит подтвердить" has FA "sessync forget $G1 -y" forget $G1
+check "и ничего не тронуто" test -f "$f9/$G1.jsonl" -a ! -e "$(stf FA forget/$G1)"
+check "forget по началу id" has FA 'Готово: удалена здесь и в хранилище' forget aaaaaaaa-1111 -y
+check "здесь: переписка и папка сессии удалены" test ! -e "$f9/$G1.jsonl" -a ! -e "$f9/$G1"
+check "здесь: файлы Claude Code о ней удалены" sh -c "test ! -e '$T/FA/session-env/$G1' -a ! -e '$T/FA/file-history/$G1' -a ! -e '$T/FA/security/security_warnings_state_$G1.json' -a ! -e '$T/claude-tmp/-tmp-f/$G1'"
+check "здесь: её промпт и вставленный текст удалены, остальное на месте" sh -c "! grep -q 'секретный вопрос' '$T/FA/history.jsonl' && grep -q 'обычный вопрос' '$T/FA/history.jsonl' && test ! -e '$T/FA/paste-cache/0123456789abcdef.txt'"
+check "другая сессия на месте" test -f "$f9/$G2.jsonl"
+check "поиск её не находит" has FA 'Ничего не найдено' find секретная
+check "в индексе поиска её текста нет" absent "$T/FA/cache/sessync/find/text" "секретная"
+check "в хранилище её нет" not inbucket $G1
+check "она в корзине — её можно вернуть" intrash $G1
+check "её промпт — тоже в корзине" sh -c "$(declare -f at); T='$T' here='$here'; at FA 'rclone lsf -R --files-only ss:trash' | grep -q 'history/$G1/hostFA.jsonl'"
+check "sessync trash помечает забытую" has FA 'забыта (sessync forget)' trash
+check "в хранилище — метка забытой сессии" sh -c "$(declare -f at); T='$T' here='$here'; at FA 'rclone lsf ss:forgotten' | grep -qx $G1"
+check "история FA в хранилище — уже без её промпта" sh -c "$(declare -f at); T='$T' here='$here'; ! at FA 'rclone cat ss:history/hostFA.jsonl; rclone cat ss:seg/history/hostFA.jsonl' | grep -q 'секретный вопрос'"
+check "запрос выполнен — метка на этом Mac снята" test ! -e "$(stf FA forget/$G1)"
+check "рабочая папка движка после запуска убрана (в ней копии переписки)" test ! -e "$(stf FA engine/work-projects)"
+check "дальше спокойно" has FA 'отправлено файлов 0, получено 0' now
+run FB now >/dev/null
+check "FB: сессия удалена" test ! -e "$T/FB/projects/-tmp-f/$G1.jsonl" -a ! -e "$T/FB/projects/-tmp-f/$G1"
+check "FB: её промпта в истории нет, остальное есть" sh -c "! grep -q 'секретный вопрос' '$T/FB/history.jsonl' && grep -q 'обычный вопрос' '$T/FB/history.jsonl'"
+check "FB: копия истории FA — версия хранилища, без конфликта" sh -c "! grep -q 'секретный вопрос' '$T/FB/state/sessync/history/hostFA.jsonl' && test -z \"\$(find '$T/FB/state/sessync/history' -name '*.conflict*')\""
+check "FB: дальше спокойно" has FB 'отправлено файлов 0, получено 0' now
+run FA now >/dev/null
+check "FA: промпт не вернулся" not contains "$T/FA/history.jsonl" "секретный вопрос"
+check "restore возвращает забытую с её промптами" has FA 'Её промпты вернулись в историю: 1' restore $G1
+check "переписка и субагент на месте" sh -c "grep -q 'секретная разовая' '$f9/$G1.jsonl' && test -f '$f9/$G1/subagents/agent-1.jsonl'"
+check "промпт в истории" contains "$T/FA/history.jsonl" "секретный вопрос"
+check "метки в хранилище больше нет" not sh -c "$(declare -f at); T='$T' here='$here'; at FA 'rclone lsf ss:forgotten' | grep -qx $G1"
+run FA now >/dev/null; run FB now >/dev/null
+check "FB: вернулась и туда" contains "$T/FB/projects/-tmp-f/$G1.jsonl" "секретная разовая"
+check "FB: и её промпт" contains "$T/FB/history.jsonl" "секретный вопрос"
+check "забыть снова" has FA 'Готово' forget $G1 -y
+run FB now >/dev/null
+check "FB: снова удалена, и промпт тоже" sh -c "test ! -e '$T/FB/projects/-tmp-f/$G1.jsonl' && ! grep -q 'секретный вопрос' '$T/FB/history.jsonl'"
+check "в контрольном файле — формат 3 (версии 2.x останавливаются)" sh -c "$(declare -f at); T='$T' here='$here'; at FA 'rclone cat ssk:keycheck' | grep -qx 'format 3'"
+
+say FA -tmp-f $G3 "удалённая обычным способом"
+run FA now >/dev/null; rm "$f9/$G3.jsonl"; run FA now >/dev/null
+check "обычное удаление — в корзине" intrash $G3
+check "--now сессии, которой здесь нет, — по полному id" has FA 'на этом Mac нет' forget $G3 --now -y
+check "--now: её копии в корзине удалены" not intrash $G3
+
+say FA -tmp-f $G11 "насовсем и сразу"
+hl FA $G11 "вопрос насовсем"
+run FA now >/dev/null
+check "--now без id внутри сессии всё равно просит подтвердить" sh -c "$(declare -f ss); T='$T' here='$here'; export CLAUDE_CODE_SESSION_ID=$G11; ss FA forget --now | grep -q 'sessync forget $G11 --now -y'"
+check "--now" has FA 'удалена насовсем' forget $G11 --now -y
+check "--now: ни в хранилище, ни в корзине, промпта нигде нет" sh -c "$(declare -f at inbucket intrash); T='$T' here='$here'; ! inbucket $G11 && ! intrash $G11 && ! grep -q 'вопрос насовсем' '$T/FA/history.jsonl'"
+check "--now: вернуть нечего" not run FA restore $G11
+
+say FA -tmp-f $G12 "срок вышел"
+run FA now >/dev/null
+SESSYNC_TEST_TODAY=2020-01-01 ss FA forget $G12 -y >/dev/null
+check "забытая «в прошлом» — в корзине" intrash $G12
+run FA now >/dev/null   # новый день — очистка корзины
+check "срок корзины вышел — удалена насовсем" not intrash $G12
+check "и вернуть её нельзя" not run FA restore $G12
+
+say FA -tmp-f $G4 "открытая сессия"
+run FA now >/dev/null; run FB now >/dev/null
+opn FA $G4
+check "открытая: удалю, когда выйдете" has FA 'когда вы из неё выйдете' forget $G4 -y
+say FA -tmp-f $G4 "дописано после forget"
+run FA now >/dev/null; run FB now >/dev/null
+check "пока открыта — файл не тронут" contains "$f9/$G4.jsonl" "дописано после forget"
+check "и дописанное не отправляется" not contains "$T/FB/projects/-tmp-f/$G4.jsonl" "дописано после forget"
+check "status: ждёт удаления" has FA 'Ждут удаления' status
+cls FA $G4; run FA now >/dev/null
+check "закрыли — удалена" test ! -e "$f9/$G4.jsonl"
+run FB now >/dev/null
+check "и на FB" test ! -e "$T/FB/projects/-tmp-f/$G4.jsonl"
+
+say FA -tmp-f $G5 "текущая сессия"
+hl FA $G5 "вопрос текущей сессии"
+run FA now >/dev/null
+opn FA $G5
+check "без id внутри сессии — сама сессия, после выхода" sh -c "$(declare -f ss); T='$T' here='$here'; export CLAUDE_CODE_SESSION_ID=$G5; ss FA forget | grep -q 'когда вы из неё выйдете'"
+cls FA $G5
+hook FA end "{\"session_id\":\"$G5\"}"
+check "хук конца: удалена здесь" test ! -e "$f9/$G5.jsonl"
+check "и её промпт" not contains "$T/FA/history.jsonl" "вопрос текущей сессии"
+check "и в хранилище её нет" not inbucket $G5
+G10=edededed-1010-4010-8010-101010101010
+say FA -tmp-f $G10 "текущая, а переменной с id нет"
+sleep 60 & cpid=$!
+SESSYNC_TEST_CLAUDE_PID=$cpid resume FA $G10 -tmp-f startup   # хук старта: сессия в списке открытых
+check "без id и без CLAUDE_CODE_SESSION_ID — по процессу claude" sh -c "$(declare -f ss); T='$T' here='$here'; SESSYNC_TEST_CLAUDE_PID=$cpid ss FA forget | grep -q 'когда вы из неё выйдете'"
+check "и это та самая сессия" test -e "$(stf FA forget/$G10)"
+kill $cpid; wait $cpid 2>/dev/null
+run FA now >/dev/null
+check "claude вышел — удалена" test ! -e "$f9/$G10.jsonl"
+
+say FA -tmp-f $G6 "начало G6"
+run FA now >/dev/null; run FB now >/dev/null
+say FB -tmp-f $G6 "FB дописал, ещё не зная"
+hl FB $G6 "вопрос FB в G6"
+check "forget на FA" has FA 'Готово' forget $G6 -y
+run FB now >/dev/null
+check "FB: дописанное не вернуло её в хранилище" not inbucket $G6
+check "FB: удалена и там" test ! -e "$T/FB/projects/-tmp-f/$G6.jsonl"
+check "FB: свой промпт этой сессии тоже удалён и не отправлен" not contains "$T/FB/history.jsonl" "вопрос FB в G6"
+run FA now >/dev/null
+check "FA: промпт FB не пришёл" not contains "$T/FA/history.jsonl" "вопрос FB в G6"
+
+say FA -tmp-f $G7 "сессия при выключенной синхронизации"
+run FA now >/dev/null
+run FA off >/dev/null
+check "выключено: удалена на этом Mac" has FA 'Синхронизация выключена' forget $G7 -y
+check "файла нет" test ! -e "$f9/$G7.jsonl"
+check "в хранилище пока есть" inbucket $G7
+check "отменить, когда файлы уже удалены, — нельзя" has FA 'Отменить уже нельзя' forget --cancel $G7
+opn FA $G9
+say FA -tmp-f $G9 "выключено и открыта"
+check "выключено и открыта: после выхода" has FA 'когда вы из неё выйдете' forget $G9 -y
+cls FA $G9
+printf '{"session_id":"%s"}' $G9 | ss FA hook end
+for i in $(seq 1 75); do test -e "$f9/$G9.jsonl" || break; sleep 0.2; done
+check "выключено: хук конца удалил её на этом Mac" test ! -e "$f9/$G9.jsonl"
+run FA on >/dev/null
+check "включили — из хранилища удалена" not inbucket $G7
+check "и лежит в корзине" intrash $G7
+
+say FA -tmp-f $G8 "передумали"
+opn FA $G8
+ss FA forget $G8 -y >/dev/null
+check "отмена" has FA 'Отменено' forget --cancel $G8
+cls FA $G8
+run FA now >/dev/null; run FB now >/dev/null
+check "отменённая осталась и синхронизируется" test -f "$T/FB/projects/-tmp-f/$G8.jsonl"
+check "отменять нечего" has FA 'Отменять нечего' forget --cancel $G8
+check "английский: forget" sh -c "$(declare -f ss); T='$T' here='$here'; SESSYNC_LANG=en ss FA forget --cancel $G8 | grep -q 'Nothing to undo'"
+
 echo "== Другое имя пользователя на другом Mac"
 mkdir -p "$T/s3/bucket7"
 for m in U V; do mac $m; setconf $m bucket7; done
@@ -576,6 +751,8 @@ echo "== Мелочи"
 src() { CLAUDE_CONFIG_DIR="$T/A" XDG_CONFIG_HOME="$T/A/config" XDG_STATE_HOME="$T/A/state" bash -c "source '$here/bin/sessync' version >/dev/null; $1"; }
 hostid_ok() { env -u SESSYNC_HOST bash -c "source '$here/bin/sessync' version >/dev/null; host_id" | grep -Eq -- '-[0-9A-F]{8}$'; }
 check "файл истории Mac: имя + начало аппаратного UUID (имена Mac совпадают)" hostid_ok
+hostid_path() { env -u SESSYNC_HOST PATH=/usr/bin:/bin /bin/bash -c "source '$here/bin/sessync' version >/dev/null; host_id" | grep -Eq -- '-[0-9A-F]{8}$'; }
+check "то же имя и без /usr/sbin в PATH (так запускаются хуки)" hostid_path
 mkdir -p "$T/dotfiles" "$T/H/projects"; setconf H bucket
 printf '{"cleanupPeriodDays": 30}\n' > "$T/dotfiles/settings.json"; chmod 644 "$T/dotfiles/settings.json"
 ln -s "$T/dotfiles/settings.json" "$T/H/settings.json"

@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.0.0 — 2026-10-11
+
+- `sessync forget <id>` deletes a session everywhere, for a conversation that was never meant to be
+  kept: here and in the storage, on your other Macs with their next sync, its prompts in the prompt
+  history on every Mac (with the text pasted into them), what Claude Code keeps of it outside the
+  projects folder (`session-env`, `file-history`, `todos`, `debug`, `security`, its temporary
+  folder), its text in the search index. The conversation and its prompts wait in the storage trash
+  for `TRASH_DAYS` (30): `sessync restore <id>` brings them back on any Mac, and the other Macs get
+  the session again. `--now` deletes it for good at once, its copies in the trash too. Inside a
+  session, `! sessync forget` forgets that session once you leave it; until then it is not synced.
+  `--cancel` changes your mind while nothing is deleted yet. `sessync status` shows sessions
+  waiting for it, `sessync trash` marks forgotten ones.
+- Storage format 3: marks of forgotten sessions (`forgotten/<id>`), and another Mac's prompt
+  history follows its storage version even when it got shorter. sessync 2.x stops with "the storage
+  is in a newer format — update sessync" instead of bringing forgotten prompts back: update every
+  Mac.
+- Fix: hooks start without `/usr/sbin` in `PATH`, so there sessync could not read the hardware UUID,
+  and this Mac's prompt history went to a second file named without it.
+- The engine's work folder — copies of what travelled, session text among them — is deleted at the
+  end of every run instead of staying until the next one.
+
 ## 2.1.1 — 2026-10-11
 
 - `claude -r` waits about a second instead of up to 20: the start hook checks only the resumed

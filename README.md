@@ -137,7 +137,8 @@ your messages and Claude's answers. Injected service text and tool output are se
 | `sessync off` / `on` | turn automatic sync off / on |
 | `sessync conflicts` | sessions that went two ways on two Macs, and copies of other files; `--delete` deletes the copies |
 | `sessync trash` | deleted sessions in the storage trash |
-| `sessync restore <id>` | bring a session back from the trash |
+| `sessync restore <id>` | bring a session back from the trash; a forgotten one — with its prompts |
+| `sessync forget <id>` | delete a session here, in the storage and on your other Macs, with its prompts; `restore` brings it back for 30 days, `--now` deletes it for good at once; `! sessync forget` inside a session — that one, once you leave it |
 | `sessync deletes` | what was deleted when sync stopped on a mass deletion; `--undo` brings it back, `--apply` deletes everywhere |
 | `sessync setup` | storage (`--storage` to change it), keys, password |
 | `sessync export` | save the keys and the password to Passwords |
@@ -179,6 +180,9 @@ Add this to `~/.claude/CLAUDE.md`, so Claude in any project knows the archive is
   or publish them: they hold whole conversations, including files with keys that were read.
 - The storage keys and the encryption password are in the Keychain: never print their values into
   the chat or logs. They are entered only with `sessync setup` in my own terminal.
+- To delete a session (here, in the storage, on all my Macs, with its prompts): `sessync forget <id>`;
+  for 30 days `sessync restore <id>` brings it back, `--now` deletes it for good at once. This very
+  session: I type `! sessync forget`, and it goes once I leave it.
 ```
 
 ## Different user names
@@ -216,8 +220,31 @@ version contains the previous one whole.
   carry those service sessions to all your Macs.
 - Delete a whole project: `claude purge <folder>` (a Claude Code command). It is deleted on your
   other Macs too, and a copy stays in the trash for 30 days.
-- Delete one session: delete the `<id>.jsonl` file and the `<id>/` folder next to it (subagents and
-  attachments).
+- Delete one session everywhere — say, one opened for a single quick question: `sessync forget <id>`
+  (the id is in `sessync find`; a unique start of it will do). It asks first; `-y` skips the question.
+  From inside the session itself type `! sessync forget`: it goes once you leave it (`/exit`), and
+  until then it is not synced; `sessync forget --cancel <id>` changes your mind. What goes:
+  - the conversation and its folder (subagents, attachments), here and in the storage;
+  - its prompts in the prompt history (↑), with the text pasted into them, also in this Mac's
+    history file in the storage;
+  - what Claude Code keeps of it outside the projects folder: files and folders named after its id
+    (`session-env`, `file-history`, `todos`, `debug`, `security`) and its temporary folder
+    `/tmp/claude-<uid>/<project>/<id>`;
+  - its text in the search index.
+
+  Your other Macs do the same with their next sync (a session open there goes once it closes). The
+  conversation and its prompts wait in the storage trash for 30 days (`TRASH_DAYS`):
+  `sessync restore <id>` brings them back on any Mac, and then the session returns to the other
+  Macs too; after that they are gone for good. Claude Code's own files of it (`/rewind` checkpoints,
+  the temporary folder) don't come back. For a conversation that must leave no copy at all:
+  `sessync forget <id> --now` — no trash, and its earlier copies there go too.
+
+  What stays: the project's `memory/` (each Mac has its own), its branches "… (Branch)" — separate
+  sessions, forget them by their own ids — and what reached Anthropic during the conversation. Its
+  prompts in the history file of a Mac that no longer syncs stay in the storage, encrypted: only that
+  Mac rewrites its file, and no Mac shows them.
+- Delete one session keeping a copy in the trash for 30 days: delete the `<id>.jsonl` file and the
+  `<id>/` folder next to it (subagents and attachments).
 
 ## Security
 
@@ -233,7 +260,8 @@ in [SECURITY.md](SECURITY.md).
   switching to another Mac.
 - Continuing one session on two Macs at the same time splits it into two sessions. Nothing is lost,
   but the conversation ends up in two places.
-- A deletion on one Mac reaches the others (and the trash keeps a copy for 30 days).
+- A deletion on one Mac reaches the others (and the trash keeps a copy for 30 days; after
+  `sessync forget --now` there is no copy).
 - Only sessions and prompt history are synced. Settings, plugins, skills, `/rewind` checkpoints and
   `memory/` folders are not — keep those in a git repository of your `~/.claude`.
 - sessync relies on Claude Code only appending to session files. If that changes, sessync has to
@@ -311,11 +339,19 @@ sessions deleted again.
   `RESUME_CHECK=off` in the config turns the check off.
 - **Deletions.** What is deleted on this Mac is copied to the trash first. A session deleted on
   another Mac but open here is deleted here after it closes.
+- **Forgetting** (`sessync forget`). Once the session is closed, the Mac puts a mark with its id into
+  the storage and moves the session and its prompts to the trash; every Mac that meets the mark
+  deletes its own copy and takes its prompts out of the history, and doesn't send or receive that
+  session while the mark is there. `sessync restore` takes the mark away. With `--now` it is the one
+  deletion without the trash.
 - **Prompt history.** Each Mac has its own file in the storage (Mac name plus the start of its
-  hardware UUID), only appended to; on each Mac all these files are merged line by line, without
-  repeats.
+  hardware UUID) and only that Mac writes it, appending its new prompts; the others only receive it.
+  On each Mac all these files are merged line by line, without repeats. When `sessync forget` takes
+  a session's prompts out of a Mac's file, that Mac sends the file whole, and the others take the
+  new version.
 - **Format.** The storage format is recorded in a check file. When the format is newer than the
-  installed version knows, that version stops instead of writing the old way.
+  installed version knows, that version stops instead of writing the old way. Format 3 came with
+  `sessync forget`: a 2.x version would bring forgotten prompts back, so it stops.
 - **Files on this Mac:** state in `~/.local/state/sessync/` (log, status-line marks, engine state),
   settings in `~/.config/sessync/config`, search index in `~/.cache/sessync/find`.
 - **Tests** — `tests/run.sh`: several "Macs" and a local folder instead of the storage; they don't
