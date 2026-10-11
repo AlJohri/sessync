@@ -84,13 +84,15 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    `--opt=value`.
 10. **macOS only for now**: Keychain, `osascript`, `scutil`, `ioreg`. Keep new code portable (no
     `stat -f`, `date -j`), Linux is next.
-11. **The file of a session open on this Mac is not changed** (`opened`: Claude Code's registry
-    `~/.claude/sessions/` plus `--open`). Claude Code reads a transcript when it opens it and then
+11. **The file of a session open on this Mac is not changed** (`opened`: sessync's own list
+    `~/.local/state/sessync/open/<session id>` holding the pid of its `claude`, written by the hooks
+    from their documented input; Claude Code's internal registry `~/.claude/sessions/`; `--open`). Claude Code reads a transcript when it opens it and then
     only appends: lines put into the file under it would split the conversation inside one file,
     where Claude Code shows one branch and hides the other. Lines from another Mac and a losing
     version wait (`hold`) until the session closes; the SessionEnd hook passes its id
-    (`--wait-closed`). The SessionStart hook on resume syncs in the foreground (20 s at most) and
-    may print one JSON object (a warning) — nothing else goes to its stdout.
+    (`--wait-closed`). The SessionStart hook on resume runs only `engine ahead` in the foreground
+    (this session's objects, 6 s at most; `RESUME_CHECK=off` skips it) and may print one JSON object
+    (a warning) — nothing else goes to its stdout; the sync itself runs in the background.
 12. **Branches.** A session (`<project>/<uuid>.jsonl`) that went two ways becomes two sessions, as
     Claude Code's `/branch` makes them. The branch id is `uuid5(FORK_NS, "<session id>:<sha256 of
     the first line where the versions part>")` and its file is the common start, a `custom-title`

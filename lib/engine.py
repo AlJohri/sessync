@@ -33,7 +33,8 @@ whose branch is already a separate session gives way and appends to it. A contin
 Claude Code's service lines (a session opened and closed, /exit) is not worth a branch and goes.
 Other files keep the longer version under the name and the other next to it as <file>.conflictN.
 
-The file of a session open in claude on this Mac (--sessions, --open) is not changed: Claude Code
+The file of a session open in claude on this Mac (Claude Code's registry --sessions, sessync's
+own hooks --own-open, --open) is not changed: Claude Code
 has it in memory and would go on from what it read. What came from another Mac waits until the
 session closes (--held-out names such sessions); this Mac's own lines go out as usual.
 
@@ -45,6 +46,8 @@ than --max-delete percent of deletions stop the sync until the user decides (lik
 named after the absolute path by Claude Code) under the storage's home prefix REMOTE are LOCAL here.
 
   engine.py sync TREE LOCAL_DIR BASES TAILS STATE --host MAC --work DIR [options]
+  engine.py ahead BASES TAILS HISTORY FILE STATE --key=KEY --host MAC
+                                      claude -r: has another Mac written lines of this session?
   engine.py fetch BASE TAILS FILE     assemble a transcript from a base and tails (trash restore)
 
 sync prints "sent received bytes-sent bytes-received"; exit code 3 — stopped because of deletions,
@@ -255,6 +258,33 @@ def open_sessions(d):
             continue
         if isinstance(sid, str):
             ids.add(sid)
+    return ids
+
+
+def own_open(d):
+    """Sessions sessync's own hooks saw start (<dir>/<session id> holding the pid of its claude):
+    from the hook's input, a documented interface, so this works even if Claude Code's registry
+    changes. An entry whose claude has exited is gone."""
+    ids = set()
+    try:
+        names = os.listdir(d) if d else []
+    except OSError:
+        return ids
+    for n in names:
+        p = os.path.join(d, n)
+        try:
+            with open(p, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+        except PermissionError:
+            pass
+        except (OSError, ValueError):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            continue
+        ids.add(n)
     return ids
 
 
@@ -849,11 +879,11 @@ class Engine:
         self.flush_pending()
         if self.a.wait_closed:  # from the hook of a session that is closing: claude exits right after it
             t0 = time.time()
-            while self.a.wait_closed in open_sessions(self.a.sessions) and time.time() - t0 < 30:
+            while self.a.wait_closed in self.open_now() and time.time() - t0 < 30:
                 time.sleep(0.5)
         loc = self.local_files()
         rem = self.rem = self.remote()
-        opened = self.opened = open_sessions(self.a.sessions) | set(self.a.open)
+        opened = self.opened = self.open_now() | set(self.a.open)
         known = len(self.files)
 
         for key in sorted(set(loc) | set(rem) | set(self.files)):
@@ -907,6 +937,10 @@ class Engine:
         self.outputs()
         print(self.up, self.down, self.bup, self.bdown)
         return 0
+
+    def open_now(self):
+        """Sessions open in claude on this Mac: Claude Code's registry and sessync's own hooks."""
+        return open_sessions(self.a.sessions) | own_open(self.a.own_open)
 
     def outputs(self):
         """For sessync: open sessions that wait for another Mac's lines (id, that Mac), new branches
@@ -1053,12 +1087,18 @@ class Engine:
                           ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         tmp = os.path.join(self.work, "fork", fid + ".jsonl")
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        moved = 0
         with open(tmp, "wb") as out:
             for line in iter_lines(parts, 0, c):
+                moved += line.count(old)
                 out.write(line.replace(old, new))
             out.write(mark)
             for line in iter_lines(parts, c, end):
+                moved += line.count(old)
                 out.write(line.replace(old, new))
+        if not moved:  # the lines don't name their session the way this code expects: no branch
+            log(f"{key}: " + tx("the lines don't carry the session id as expected", "в строках нет id сессии в ожидаемом виде"))
+            return False
         n = os.path.getsize(tmp)
         if not os.path.lexists(fpath):
             place_new(tmp, fpath)
@@ -1292,6 +1332,90 @@ class Engine:
             log(tx("deleted here: ", "удалено здесь: ") + str(len(self.del_local)) + tx(" files deleted on another Mac", " файлов, удалённых на другом Mac"))
 
 
+def quick(args, deadline):
+    """An rclone call for the claude -r check: short timeouts, no retries — no answer is better than a
+    long wait. None — no answer in time, or an error."""
+    left = deadline - time.time()
+    if left < 0.3:
+        return None
+    try:
+        p = subprocess.run(["rclone", *args, "--retries", "1", "--low-level-retries", "1",
+                            "--contimeout", "3s", "--timeout", "4s"], capture_output=True, timeout=left)
+    except subprocess.TimeoutExpired:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def history_host(history, sid, me, deadline):
+    """The Mac with the latest prompt in this session: each line of a Mac's prompt history names its
+    session. For when the new lines came in a base, whose name doesn't say which Mac sent it."""
+    out = quick(["lsf", "--files-only", history], deadline)
+    best, name = 0, ""
+    for fn in (out or b"").decode("utf-8", "replace").split():
+        h = fn[:-6]
+        if not fn.endswith(".jsonl") or h == me or me.startswith(h + "-"):  # this Mac's, also by its old name
+            continue
+        for line in (quick(["cat", "--tail", "262144", f"{history}/{fn}"], deadline) or b"").splitlines():
+            if sid.encode() not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("sessionId") == sid and isinstance(d.get("timestamp"), (int, float)) \
+                    and d["timestamp"] > best:
+                best, name = d["timestamp"], h
+    return name
+
+
+def cmd_ahead(a):
+    """claude -r has just opened a session: has another Mac written lines of it that this Mac hasn't
+    got? Only this session's objects are listed — a second or so, not a whole sync; 6 s at most.
+    Prints "ahead<TAB><that Mac, if known>", or nothing."""
+    deadline = time.time() + 6
+    mr, ml = a.map.split(":", 1) if a.map else (None, None)
+    key = Engine.swap(a.key, ml, mr)
+    if unsafe(key) or not key.endswith(".jsonl"):
+        return 0
+    try:
+        with open(a.state, encoding="utf-8") as f:
+            st = json.load(f).get("files", {}).get(key)
+    except (OSError, ValueError):
+        st = None
+    out = quick(["lsjson", "--files-only", "--no-mimetype", f"{a.base}/{key}"], deadline)
+    items = json.loads(out) if out else []
+    if len(items) != 1:
+        return 0
+    rf = RFile()
+    rf.base = (items[0]["Size"], items[0].get("ModTime", ""))
+    out = quick(["lsjson", "--files-only", "--no-mimetype", f"{a.seg}/{key}"], deadline)
+    for it in json.loads(out) if out else []:
+        s = parse_seg(it["Path"], it["Size"], it.get("ModTime", ""))
+        if s:
+            rf.segs.append(s)
+    rf.finish()
+    me = re.sub(r"[^A-Za-z0-9.-]", "-", a.host)
+    s = st.get("s") if isinstance(st, dict) else None
+    if s is None:  # never synced here: compare with the file
+        try:
+            have = complete_end(a.file, os.path.getsize(a.file), 0)
+        except OSError:
+            have = 0
+        if rf.L <= have:
+            return 0
+        tails = [x for x in rf.chain if x.end > have]
+    else:
+        if rf.L <= s:
+            return 0
+        tails = [x for x in rf.chain if x.end > s]
+        if rf.base[0] <= s and tails and all(x.host == me for x in tails):
+            return 0  # this Mac's own lines, sent earlier
+    who = [x.host for x in tails if x.host != me]
+    name = who[-1] if who else history_host(a.history, key.rsplit("/", 1)[-1][:-6], me, deadline)
+    print("ahead\t" + re.sub(r"-[0-9A-Fa-f]{8}$", "", name))
+    return 0
+
+
 def cmd_fetch(base, segdir, out):
     """A transcript from a base and tails — for restoring from the trash."""
     items = listing(base)
@@ -1335,19 +1459,29 @@ def main():
     s.add_argument("--wait-closed", metavar="SESSION")   # wait (30 s at most) until it is closed
     s.add_argument("--held-out")
     s.add_argument("--forks-out")
+    s.add_argument("--own-open", metavar="DIR")
     s.add_argument("--log")
+    k = sub.add_parser("ahead")
+    for name in ("base", "seg", "history", "file", "state"):
+        k.add_argument(name)
+    k.add_argument("--key", required=True)  # given as --key=…: project folders start with "-"
+    k.add_argument("--host", required=True)
+    k.add_argument("--map", metavar="REMOTE:LOCAL")
+    k.add_argument("--log")
     f = sub.add_parser("fetch")
     for name in ("base", "segdir", "out"):
         f.add_argument(name)
     f.add_argument("--log")
     a = ap.parse_args()
     if not a.cmd:
-        ap.error(tx("a command is needed: sync or fetch", "нужна команда: sync или fetch"))
+        ap.error(tx("a command is needed: sync, ahead or fetch", "нужна команда: sync, ahead или fetch"))
     LOG = a.log
     try:
         if a.cmd == "fetch":
             cmd_fetch(a.base, a.segdir, a.out)
             return 0
+        if a.cmd == "ahead":
+            return cmd_ahead(a)
         os.makedirs(os.path.dirname(a.state), exist_ok=True)
         return Engine(a).run()
     except (Fail, OSError) as e:

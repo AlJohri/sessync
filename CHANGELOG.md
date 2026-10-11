@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.1 — 2026-10-11
+
+- `claude -r` waits about a second instead of up to 20: the start hook checks only the resumed
+  session against the storage (6 s at most), and the whole sync goes on in the background.
+  `RESUME_CHECK=off` in the config turns the check off.
+- The warning names the other Mac also when its lines went to the storage whole: the name comes from
+  that Mac's prompt history, whose lines name their session.
+- sessync keeps its own list of open sessions, from the hooks' input (documented by Claude Code),
+  next to Claude Code's internal registry: if that one changes, open sessions are still left alone.
+- A branch is made only if the session's lines carry its id the way sessync expects; otherwise the
+  other version is kept as a copy, as before 2.1.0.
+
 ## 2.1.0 — 2026-10-11
 
 - A session continued on two Macs between syncs now splits the way Claude Code's own `/branch`

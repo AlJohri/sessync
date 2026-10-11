@@ -382,17 +382,36 @@ say K1 -tmp-k4 $S4 "начало четвёртой"
 run K1 now >/dev/null; run K2 now >/dev/null
 say K2 -tmp-k4 $S4 "продолжение на K2"
 run K2 now >/dev/null
-hook() { printf '{"session_id":"%s","source":"%s"}' "$2" "$3" | ss "$1" hook start > "$T/hook.out" 2>&1; }
-hook K1 $S4 resume
+hook() {  # hook A start|end json — хук Claude Code с его входом; ждёт фоновую синхронизацию
+  printf '%s' "$3" | ss "$1" hook "$2" > "$T/hook.out" 2>&1; waitrun
+}
+resume() { hook "$1" start "{\"session_id\":\"$2\",\"source\":\"${4:-resume}\",\"transcript_path\":\"$T/$1/projects/$3/$2.jsonl\"}"; }
+resume K1 $S4 -tmp-k4
 check "claude -r старой версии: предупреждение" jq -e --arg s "$S4" '.systemMessage | contains("claude -r " + $s) and contains("hostK2")' "$T/hook.out"
 check "и подсказка для Claude" jq -e '.hookSpecificOutput.additionalContext | contains("older")' "$T/hook.out"
 check "файл открытой сессии не тронут" not contains "$k4" "продолжение на K2"
 run K1 now >/dev/null
 check "после выхода — свежая версия" contains "$k4" "продолжение на K2"
-hook K1 $S4 resume
+resume K1 $S4 -tmp-k4
 check "свежая — без предупреждения" test ! -s "$T/hook.out"
-hook K1 $S4 startup; waitrun
+resume K1 $S4 -tmp-k4 startup
 check "новая сессия — хук молчит" test ! -s "$T/hook.out"
+say K1 -tmp-k4 $S4 "дописано на K1 и ещё не отправлено"
+resume K1 $S4 -tmp-k4
+check "свои неотправленные строки — не повод для предупреждения" test ! -s "$T/hook.out"
+run K1 now >/dev/null; run K2 now >/dev/null
+pad=$(printf '%0900d' 0)
+say K2 -tmp-k4 $S4 "длинная строка K2 уходит новой основой $pad"
+printf '{"display":"вопрос с K2","timestamp":1790000000000,"project":"/tmp/-tmp-k4","sessionId":"%s"}\n' $S4 >> "$T/K2/history.jsonl"
+run K2 now >/dev/null
+check "строки ушли новой основой, без хвостов" test -z "$(at K2 "rclone lsf -R --files-only ss:seg/projects/-tmp-k4" 2>/dev/null)"
+resume K1 $S4 -tmp-k4
+check "имя другого Mac — из его истории промптов" jq -e '.systemMessage | contains("(hostK2)")' "$T/hook.out"
+echo RESUME_CHECK=off >> "$T/K1/config/sessync/config"
+resume K1 $S4 -tmp-k4
+check "RESUME_CHECK=off: без проверки и ожидания" test ! -s "$T/hook.out"
+sed -i '' '/RESUME_CHECK/d' "$T/K1/config/sessync/config"
+run K1 now >/dev/null
 say K2 -tmp-k4 $S4 "ещё с K2, пока на K1 сессия закрывается"
 run K2 now >/dev/null
 sleep 3 & spid=$!
@@ -401,6 +420,36 @@ printf '{"session_id":"%s"}' $S4 | ss K1 hook end
 for i in $(seq 1 75); do grep -q 'пока на K1 сессия закрывается' "$k4" && break; sleep 0.2; done
 check "хук конца ждёт выхода claude и получает дописанное" contains "$k4" "пока на K1 сессия закрывается"
 wait $spid 2>/dev/null; rm -f "$T/K1/sessions/$spid.json"; waitrun
+
+S6=66666666-6666-4666-8666-666666666666
+k6=$T/K1/projects/-tmp-k6/$S6.jsonl
+say K1 -tmp-k6 $S6 "начало шестой"
+run K1 now >/dev/null; run K2 now >/dev/null
+sleep 60 & cpid=$!
+SESSYNC_TEST_CLAUDE_PID=$cpid resume K1 $S6 -tmp-k6 startup
+check "хук старта записал открытую сессию в свой список" test "$(cat "$(stf K1 open/$S6)" 2>/dev/null)" = "$cpid"
+say K2 -tmp-k6 $S6 "с K2, пока сессия открыта на K1"
+run K2 now >/dev/null; run K1 now >/dev/null
+check "открыта по своему списку sessync (реестра Claude Code нет) — не меняется" not contains "$k6" "пока сессия открыта"
+hook K1 end "{\"session_id\":\"$S6\",\"reason\":\"clear\"}"
+check "/clear: сессия закрыта, хотя claude работает дальше" test ! -e "$(stf K1 open/$S6)"
+check "и дописанное пришло" contains "$k6" "пока сессия открыта"
+SESSYNC_TEST_CLAUDE_PID=$cpid resume K1 $S6 -tmp-k6 startup
+kill $cpid; wait $cpid 2>/dev/null
+say K2 -tmp-k6 $S6 "с K2 после выхода claude"
+run K2 now >/dev/null; run K1 now >/dev/null
+check "claude вышел — запись в списке не держит сессию" contains "$k6" "после выхода claude"
+check "и убрана" test ! -e "$(stf K1 open/$S6)"
+
+S7=77777777-7777-4777-8777-777777777777
+k7=$T/K1/projects/-tmp-k7
+line7() { printf '{"type": "user", "message": {"role": "user", "content": "%s"}, "sessionId": "%s"}\n' "$3" $S7 >> "$T/$1/projects/-tmp-k7/$S7.jsonl"; }
+mkdir -p "$k7" "$T/K2/projects/-tmp-k7"; line7 K1 x "начало седьмой"
+run K1 now >/dev/null; run K2 now >/dev/null
+line7 K1 x "ветка K1"; line7 K2 x "ветка K2, длиннее"
+run K1 now >/dev/null; run K2 now >/dev/null
+check "строки не в ожидаемом формате — не ветка, а копия" sh -c "test -z \"\$(ls '$T/K2/projects/-tmp-k7' | grep -vx '$S7.jsonl' | grep -v conflict)\" && grep -q 'ветка K1' '$T/K2/projects/-tmp-k7/$S7.jsonl.conflict1'"
+run K2 conflicts --delete >/dev/null; run K2 now >/dev/null; run K1 now >/dev/null
 
 mkdir "$(stf K1 lock)"
 (sleep 2; rmdir "$(stf K1 lock)") &

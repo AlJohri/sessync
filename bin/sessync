@@ -8,7 +8,7 @@
 # When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
 # When the last claude closes, the background loop ends by itself.
 set -u
-VERSION=2.1.0
+VERSION=2.1.1
 # Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
 # like Claude Code's own transcripts
 umask 077
@@ -30,12 +30,12 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"   # hooks and the loop star
 PY=${SESSYNC_PYTHON:-python3}   # python 3.9 or newer; the tests also run /usr/bin/python3
 
 STORAGE="" PROVIDER=Other ENDPOINT="" REGION="" BUCKET="" REMOTE="" INTERVAL=600
-KEYCHAIN_SERVICE=sessync TRASH_DAYS=30 UI_LANG=""
+KEYCHAIN_SERVICE=sessync TRASH_DAYS=30 UI_LANG="" RESUME_CHECK=on""
 if [ -f "$conf" ]; then
   while IFS='=' read -r k v; do
     v=${v%\"}; v=${v#\"}
     case "$k" in
-      STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|INTERVAL|KEYCHAIN_SERVICE|TRASH_DAYS) printf -v "$k" '%s' "$v" ;;
+      STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|INTERVAL|KEYCHAIN_SERVICE|TRASH_DAYS|RESUME_CHECK) printf -v "$k" '%s' "$v" ;;
       LANGUAGE) UI_LANG=$v ;;
     esac
   done < <(grep -E '^[A-Z_]+=' "$conf")
@@ -510,7 +510,7 @@ sync_locked() {
   res=$(engine sync projects "$cfg/projects" ss:projects ss:seg/projects "$st/engine/projects.json" \
     --host "$HOST" --work "$st/engine/work-projects" --mode "$mode" --skip-memory \
     --trash "ss:trash/$(today)" --sessions "$cfg/sessions" --deleted-out "$st/deleted.txt" \
-    --held-out "$st/held" --forks-out "$st/forks-run" ${open[@]+"${open[@]}"} \
+    --held-out "$st/held" --forks-out "$st/forks-run" --own-open "$st/open" ${open[@]+"${open[@]}"} \
     ${map[@]+"${map[@]}"} --log "$st/run.log" 2>>"$st/run.log"); rc=$?
   local up=0 down=0 bup=0 bdown=0 hist_ok=1
   [ $rc -eq 0 ] && read -r up down bup bdown <<<"$res"
@@ -562,27 +562,40 @@ sync_locked() {
 kb() { echo "$(( ($1 + 1023) / 1024 )) $(t KB КБ)"; }
 
 # claude -r: Claude Code read the session's file before this hook ran, so lines written for it on
-# another Mac since this Mac's last sync are not on screen. Sync now — Claude's first answer waits
-# for this hook anyway (20 s at most, then the sync goes on in the background) — and if the session
-# has such lines, say so. sessync doesn't change the file of an open session: they are applied once
-# it closes, and going on here would split the conversation in two.
+# another Mac since this Mac's last sync are not on screen. A quick check of this one session (a
+# second or so; Claude's first answer waits for the hook) says so; the whole sync then goes on in the
+# background, leaving the open session's file alone — its new lines are applied once it closes.
+# RESUME_CHECK=off in the config: no check and no wait.
 resume_check() {
-  local sid=$1 pid i host msg ctx
-  SESSYNC_OPEN_SID=$sid SESSYNC_WAIT_LOCK=1 nohup "$self" _run >/dev/null 2>&1 &
-  pid=$!
-  for i in $(seq 1 40); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.5
-  done
-  kill -0 "$pid" 2>/dev/null && return 0
-  host=$(awk -F'\t' -v s="$sid" '$1 == s { print "+" $2; exit }' "$st/held" 2>/dev/null)
-  [ -n "$host" ] || return 0
-  host=${host#+}
+  local sid=$1 tp=$2 key ahead="" host map=() rh lh msg ctx
+  if [ "$RESUME_CHECK" != off ] && [ "${tp#"$cfg/projects/"}" != "$tp" ] && load_env 2>/dev/null; then
+    key=${tp#"$cfg/projects/"} rh=$(enc "$(canon_home)") lh=$(enc "$HOME")
+    [ "$rh" != "$lh" ] && map=("--map=$rh:$lh")
+    ahead=$(engine ahead ss:projects ss:seg/projects ss:history "$tp" "$st/engine/projects.json" \
+      "--key=$key" --host "$(host_id)" ${map[@]+"${map[@]}"} 2>/dev/null)
+  fi
+  SESSYNC_OPEN_SID=$sid nohup "$self" _run >/dev/null 2>&1 &
+  case $ahead in ahead*) ;; *) return 0 ;; esac
+  host=$(printf '%s' "$ahead" | cut -f2)
   msg=$(t "sessync: this session was continued on another Mac${host:+ ($host)}, and this window shows an older version. To open the latest one, exit (/exit) and run: sessync && claude -r $sid. If you go on here, the conversation splits in two, and one of the branches becomes a separate session." \
     "sessync: эту сессию продолжили на другом Mac${host:+ ($host)}, а здесь открыта более старая версия. Чтобы открыть свежую, выйдите (/exit) и выполните: sessync && claude -r $sid. Если продолжить здесь, разговор разделится надвое, и одна из веток станет отдельной сессией.")
   ctx="sessync: this copy of the session is older than its latest version on another Mac${host:+ ($host)}; what was written there after this copy is not in this conversation. The user was told to exit and reopen it with: sessync && claude -r $sid"
   jq -nc --arg m "$msg" --arg c "$ctx" \
     '{systemMessage: $m, hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $c}}'
+}
+
+# The claude process this hook runs under (the hook's shell is its child): its pid keeps the session
+# in sessync's own list of open sessions, $st/open/<session id>, until it exits
+claude_pid() {
+  if [ -n "$TEST_REMOTE" ]; then [ -n "${SESSYNC_TEST_CLAUDE_PID:-}" ] && echo "$SESSYNC_TEST_CLAUDE_PID"; return; fi
+  local p=$PPID i c
+  for i in 1 2 3 4; do
+    [ "${p:-0}" -gt 1 ] 2>/dev/null || return 1
+    c=$(ps -o comm= -p "$p" 2>/dev/null)
+    case ${c##*/} in claude|[0-9]*.[0-9]*.[0-9]*) echo "$p"; return 0 ;; esac
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  return 1
 }
 
 loop_alive() {
@@ -765,19 +778,29 @@ case "${1:-now}" in
 
   hook)  # from Claude Code hooks: don't hold the session; print nothing but the warning of resume_check
     [ -f "$st/off" ] && exit 0
-    sid="" src=""
+    sid="" src="" tp="" why=""
     if [ ! -t 0 ] && command -v jq >/dev/null; then   # the hook's input: {"session_id", "source", …}
       input=$(head -c 65536)
-      sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
-      src=$(printf '%s' "$input" | jq -r '.source // empty' 2>/dev/null)
+      { IFS= read -r sid; IFS= read -r src; IFS= read -r tp; IFS= read -r why; } < <(printf '%s' "$input" \
+        | jq -r '(.session_id // ""), (.source // ""), (.transcript_path // ""), (.reason // "")' 2>/dev/null)
       case $sid in [A-Za-z0-9]*) ;; *) sid="" ;; esac   # an id, not an option
       case $sid in *[!A-Za-z0-9-]*) sid="" ;; esac
+      case $tp in *..*) tp="" ;; esac
     fi
     if [ "${2:-}" = start ] && [ -z "$TEST_REMOTE" ] && ! loop_alive; then
       nohup "$self" _loop >/dev/null 2>&1 &
     fi
+    if [ -n "$sid" ]; then   # sessync's own list of open sessions
+      mkdir -p "$st/open"
+      if [ "${2:-}" = start ] && cpid=$(claude_pid); then
+        grep -lx "$cpid" "$st/open"/* 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done   # its previous session
+        echo "$cpid" > "$st/open/$sid"
+      elif [ "${2:-}" = end ] && [ "$why" = clear ]; then
+        rm -f "$st/open/$sid"   # /clear: the same claude goes on with a new session
+      fi                        # otherwise the entry goes when its claude exits
+    fi
     if [ "${2:-}" = start ] && [ "$src" = resume ] && [ -n "$sid" ]; then
-      resume_check "$sid"
+      resume_check "$sid" "$tp"
     else
       [ "${2:-}" = end ] && export SESSYNC_CLOSING_SID=$sid
       nohup "$self" _run >/dev/null 2>&1 &

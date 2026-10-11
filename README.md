@@ -304,9 +304,11 @@ sessions deleted again.
   the other as `<name>.conflict1` next to it; a session file that got shorter is a conflict too.
 - **Open sessions.** Claude Code reads a session's file when it opens it, and from then on only
   appends to it. So sessync never changes the file of a session open in `claude` on this Mac (it
-  checks Claude Code's registry, `~/.claude/sessions/`): lines from another Mac wait until it
-  closes. On `claude -r`, the start hook syncs first (Claude's first answer waits for hooks anyway)
-  and warns if the session got lines on another Mac that this window doesn't have.
+  knows them from its own hooks and from Claude Code's registry, `~/.claude/sessions/`): lines from
+  another Mac wait until it closes. On `claude -r`, the start hook checks that one session against
+  the storage — about a second, which Claude's first answer waits for — and warns if it got lines
+  on another Mac that this window doesn't have; the whole sync goes on in the background.
+  `RESUME_CHECK=off` in the config turns the check off.
 - **Deletions.** What is deleted on this Mac is copied to the trash first. A session deleted on
   another Mac but open here is deleted here after it closes.
 - **Prompt history.** Each Mac has its own file in the storage (Mac name plus the start of its
