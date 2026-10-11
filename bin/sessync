@@ -794,8 +794,8 @@ sessync — сессии Claude Code на всех ваших Mac, через в
   sessync trash        удалённые сессии в корзине хранилища (хранятся 30 дн., TRASH_DAYS)
   sessync restore ID   вернуть сессию из корзины (id или часть пути), забытую — с её промптами
   sessync forget ID    удалить сессию здесь, в хранилище и на других Mac вместе с её промптами;
-                       30 дн. её можно вернуть (restore), --now — сразу насовсем;
-                       ! sessync forget внутри сессии — её саму, после выхода
+                       в течение 30 дн. её можно вернуть (restore), --now удаляет сразу насовсем;
+                       ! sessync forget внутри сессии удаляет её саму после выхода
   sessync deletes      если синхронизация остановилась из-за массового удаления: --undo / --apply
   sessync setup        хранилище, ключи и пароль шифрования (в своём терминале)
   sessync export       по шагам сохранить ключи и пароль в «Пароли» — для других Mac
@@ -815,8 +815,8 @@ sessync — Claude Code sessions on all your Macs, through storage you own, encr
   sessync trash        deleted sessions in the storage trash (kept 30 days, TRASH_DAYS)
   sessync restore ID   bring a session back from the trash (id or part of the path), with its prompts
   sessync forget ID    delete a session here, in the storage and on your other Macs, with its prompts;
-                       for 30 days restore brings it back, --now — for good at once;
-                       ! sessync forget inside a session — that one, once you leave it
+                       restore can bring it back within 30 days, --now deletes it for good at once;
+                       ! sessync forget inside a session deletes it once you leave it
   sessync deletes      sync stopped because of a mass deletion: --undo / --apply
   sessync setup        storage, keys and the encryption password (in your own terminal)
   sessync export       save keys and password to the Passwords app, step by step — for other Macs
@@ -1004,8 +1004,8 @@ case "${1:-now}" in
           read -rp "$(t "Delete it for good, with no way back — here, in the storage, on your other Macs, with its prompts? [y/N] " \
             "Удалить её насовсем, без возврата — здесь, в хранилище, на других Mac, вместе с её промптами? [y/N] ")" v
         else
-          read -rp "$(t "Delete it — here, in the storage, on your other Macs, with its prompts? For $TRASH_DAYS days sessync restore brings it back [y/N] " \
-            "Удалить её — здесь, в хранилище, на других Mac, вместе с её промптами? $TRASH_DAYS дн. её можно вернуть: sessync restore [y/N] ")" v
+          read -rp "$(t "Delete it — here, in the storage, on your other Macs, with its prompts? You can bring it back within $TRASH_DAYS days: sessync restore [y/N] " \
+            "Удалить её — здесь, в хранилище, на других Mac, вместе с её промптами? В течение $TRASH_DAYS дн. её можно вернуть: sessync restore [y/N] ")" v
         fi
         case $v in [yYдД]*) ;; *) say "Not deleted" "Не удалено"; exit 1 ;; esac
       else
@@ -1036,8 +1036,8 @@ case "${1:-now}" in
         say "Done: deleted for good — here, in the storage and in its trash. Your other Macs delete it with their next sync." \
           "Готово: удалена насовсем — здесь, в хранилище и в его корзине. Другие Mac удалят её при своей следующей синхронизации."
       else
-        say "Done: deleted here and in the storage; your other Macs delete it with their next sync. For $TRASH_DAYS days it can be brought back: sessync restore $sid" \
-          "Готово: удалена здесь и в хранилище, другие Mac удалят её при своей следующей синхронизации. $TRASH_DAYS дн. её можно вернуть: sessync restore $sid"
+        say "Done: deleted here and in the storage; your other Macs delete it with their next sync. You can bring it back within $TRASH_DAYS days: sessync restore $sid" \
+          "Готово: удалена здесь и в хранилище, другие Mac удалят её при своей следующей синхронизации. В течение $TRASH_DAYS дн. её можно вернуть: sessync restore $sid"
       fi
       exit 0
     fi

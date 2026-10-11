@@ -35,7 +35,7 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 - **Search.** `sessync find words` finds the sessions where something was discussed and prints the
   command to continue each one.
 - **Forget a conversation.** `sessync forget` deletes a session on every Mac and in the storage,
-  together with its prompts in the history; for 30 days `sessync restore` brings it back.
+  together with its prompts in the history; `sessync restore` can bring it back within 30 days.
 - **Sessions no longer expire after 30 days.** sessync raises Claude Code's retention
   (`cleanupPeriodDays`) to 100 years and brings back from the storage the sessions Claude Code has
   already deleted.
@@ -52,7 +52,7 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 | A truncated copy can overwrite the full one | no, it's a conflict | yes | — | yes |
 | A session continued on two Macs | two sessions, like `/branch`; both in `/resume` | `.conflict` copy | merged into one file | conflict copies |
 | Prompt history | merged line by line | last writer wins | optional | conflict copies |
-| Deletions | 30-day trash, stop on mass deletion, open sessions left alone; `forget` a session everywhere, with its prompts | deleted at once | mirrored with guards | deleted at once |
+| Deletions | 30-day trash, stop on mass deletion, open sessions left alone; `sessync forget` deletes a session everywhere, with its prompts | deleted at once | mirrored with guards | deleted at once |
 | Encryption | contents and file names | contents | none (encrypt the repo yourself) | on the provider's side |
 | Runs | automatically (Claude Code hooks) | by hand: `push` / `pull` | by hand or from cron | automatically |
 | Search | `sessync find` | — | — | — |
@@ -140,7 +140,7 @@ your messages and Claude's answers. Injected service text and tool output are se
 | `sessync conflicts` | sessions that went two ways on two Macs, and copies of other files; `--delete` deletes the copies |
 | `sessync trash` | deleted sessions in the storage trash |
 | `sessync restore <id>` | bring a session back from the trash; a forgotten one — with its prompts |
-| `sessync forget <id>` | delete a session here, in the storage and on your other Macs, with its prompts; `restore` brings it back for 30 days, `--now` deletes it for good at once; `! sessync forget` inside a session — that one, once you leave it |
+| `sessync forget <id>` | delete a session here, in the storage and on your other Macs, with its prompts; `restore` can bring it back within 30 days, `--now` deletes it for good at once; `! sessync forget` inside a session deletes that session once you leave it |
 | `sessync deletes` | what was deleted when sync stopped on a mass deletion; `--undo` brings it back, `--apply` deletes everywhere |
 | `sessync setup` | storage (`--storage` to change it), keys, password |
 | `sessync export` | save the keys and the password to Passwords |
@@ -183,8 +183,8 @@ Add this to `~/.claude/CLAUDE.md`, so Claude in any project knows the archive is
 - The storage keys and the encryption password are in the Keychain: never print their values into
   the chat or logs. They are entered only with `sessync setup` in my own terminal.
 - To delete a session (here, in the storage, on all my Macs, with its prompts): `sessync forget <id>`;
-  for 30 days `sessync restore <id>` brings it back, `--now` deletes it for good at once. This very
-  session: I type `! sessync forget`, and it goes once I leave it.
+  `sessync restore <id>` can bring it back within 30 days, and `--now` deletes it for good at once.
+  To delete this very session, I type `! sessync forget` in it, and it goes once I leave it.
 ```
 
 ## Different user names
