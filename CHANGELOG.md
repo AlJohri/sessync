@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.1 — 2026-10-14
+
+- Notifications go through [terminal-notifier](https://github.com/julienXX/terminal-notifier) 3 when it is
+  installed (`brew install terminal-notifier`): on macOS 26 notifications sent with `osascript` are
+  unreliable. Without it, sessync notifies as before. Repeated notifications replace the previous one.
+
 ## 3.0.0 — 2026-10-11
 
 - `sessync forget <id>` deletes a session everywhere, for a conversation that was never meant to be
