@@ -65,6 +65,11 @@ TEST_REMOTE="${SESSYNC_TEST_REMOTE:-}"
 log() { mkdir -p "$st"; chmod 700 "$st"; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$logf"; }
 notify() {  # the text is an argument, not part of the script: it may hold a session's title
   [ -n "$TEST_REMOTE" ] && return 0
+  # terminal-notifier 3 (UserNotifications) when installed: osascript notifications are unreliable on macOS 26
+  local tn
+  for tn in /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier; do
+    [ -x "$tn" ] && "$tn" -title sessync -message "$1" -group sessync >/dev/null 2>&1 && return 0
+  done
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "sessync"' -e 'end run' \
     "$1" >/dev/null 2>&1 || true
 }
