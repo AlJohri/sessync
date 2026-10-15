@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.2 — 2026-10-15
+
+- A background session (`claude --bg`) is kept open under its own process, not the shared `claude daemon`:
+  before, each new background session replaced the previous one's record, and the last one stayed
+  "open" while the daemon lived, so `sessync forget` and lines from other Macs waited for it. Records
+  left under the daemon's pid are removed by the hook.
+
 ## 3.0.1 — 2026-10-14
 
 - Notifications go through [terminal-notifier](https://github.com/julienXX/terminal-notifier) 3 when it is
