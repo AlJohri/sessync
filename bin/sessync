@@ -1,6 +1,6 @@
 #!/bin/bash
 # sessync — Claude Code sessions on all your Macs, through storage you own, encrypted on the Mac.
-# Docs: README.md (English), README.ru.md (по-русски). Rules for changing the code: CLAUDE.md.
+# Docs: README.md (English), README.ru.md (по-русски). Rules for changing the code: AGENTS.md.
 #
 # What: ~/.claude/projects (transcripts, their attachments, subagent sessions; not memory/ folders)
 # and ~/.claude/history.jsonl (prompt history, merged line by line). Transcripts and history are only
