@@ -692,16 +692,47 @@ resume_check() {
     '{systemMessage: $m, hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $c}}'
 }
 
+# $1 — pid, $2 — comm, ppid or args: from ps; in tests from the table SESSYNC_TEST_PROCS
+# (pid, ppid, comm, args separated by tabs)
+proc() {
+  if [ -n "$TEST_REMOTE" ]; then
+    awk -F'\t' -v p="$1" -v f="$2" '$1 == p { print (f == "ppid" ? $2 : f == "comm" ? $3 : $4) }' \
+      "${SESSYNC_TEST_PROCS:-/dev/null}"
+    return
+  fi
+  ps -o "$2=" -p "$1" 2>/dev/null
+}
+
+# What process $1 is: "session" — a claude with a session in it (claude, a version-named binary, or
+# `claude bg-spare` of a background session); "service" — the shared background service (`claude daemon`,
+# `claude bg-pty-host`): it outlives the sessions in it, so its pid would keep a closed one "open"
+proc_kind() {
+  local c
+  c=$(proc "$1" comm)
+  case ${c##*/} in
+    "claude bg-spare"*) echo session ;;
+    "claude "*) echo service ;;
+    claude|[0-9]*.[0-9]*.[0-9]*)
+      if [ "$(proc "$1" args | awk '{ print $2 }')" = daemon ]; then echo service; else echo session; fi ;;
+  esac
+}
+
 # The claude process this hook runs under (the hook's shell is its child): its pid keeps the session
-# in sessync's own list of open sessions, $st/open/<session id>, until it exits
+# in sessync's own list of open sessions, $st/open/<session id>, until it exits. A background session
+# (claude --bg) is `claude bg-spare` under `claude bg-pty-host` under `claude daemon`: the first of them
 claude_pid() {
-  if [ -n "$TEST_REMOTE" ]; then [ -n "${SESSYNC_TEST_CLAUDE_PID:-}" ] && echo "$SESSYNC_TEST_CLAUDE_PID"; return; fi
-  local p=$PPID i c
+  if [ -n "$TEST_REMOTE" ] && [ -z "${SESSYNC_TEST_PROCS:-}" ]; then
+    [ -n "${SESSYNC_TEST_CLAUDE_PID:-}" ] && echo "$SESSYNC_TEST_CLAUDE_PID"; return
+  fi
+  local p=$PPID i
+  [ -n "$TEST_REMOTE" ] && p=${SESSYNC_TEST_PPID:-}
   for i in 1 2 3 4; do
     [ "${p:-0}" -gt 1 ] 2>/dev/null || return 1
-    c=$(ps -o comm= -p "$p" 2>/dev/null)
-    case ${c##*/} in claude|[0-9]*.[0-9]*.[0-9]*) echo "$p"; return 0 ;; esac
-    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    case $(proc_kind "$p") in
+      session) echo "$p"; return 0 ;;
+      service) return 1 ;;
+    esac
+    p=$(proc "$p" ppid | tr -d ' ')
   done
   return 1
 }
@@ -902,6 +933,9 @@ case "${1:-now}" in
     fi
     if [ -n "$sid" ]; then   # sessync's own list of open sessions, kept also while sync is off
       mkdir -p "$st/open"
+      for f in "$st/open"/*; do   # up to 3.0.1 a background session was kept under the daemon's pid
+        [ -f "$f" ] && [ "$(proc_kind "$(head -c 20 "$f")")" = service ] && rm -f "$f"
+      done
       if [ "${2:-}" = start ] && cpid=$(claude_pid); then
         grep -lx "$cpid" "$st/open"/* 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done   # its previous session
         echo "$cpid" > "$st/open/$sid"

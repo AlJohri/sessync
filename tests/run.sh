@@ -631,6 +631,30 @@ kill $cpid; wait $cpid 2>/dev/null
 run FA now >/dev/null
 check "claude вышел — удалена" test ! -e "$f9/$G10.jsonl"
 
+# Фоновая сессия (claude --bg): хук идёт под `claude bg-spare`, тот — под `claude bg-pty-host` и общим
+# `claude daemon`, который живёт дольше сессий. В список открытых — pid bg-spare, не демона
+G11=edededed-1111-4011-8011-111111111111 G12=edededed-1212-4012-8012-121212121212
+say FA -tmp-f $G11 "фоновая сессия"
+sleep 60 & dpid=$!; sleep 60 & hpid=$!; sleep 60 & spid=$!; sleep 60 & ipid=$!
+procs="$T/procs.tsv"
+printf '%s\t%s\t%s\t%s\n' \
+  $spid $hpid "claude bg-spare" "claude bg-spare --bg-spare /tmp/x.claim.sock" \
+  $hpid $dpid "claude bg-pty-host" "claude bg-pty-host --bg-pty-host /tmp/x.pty.sock 200 50" \
+  $dpid 1 "/Users/u/.local/bin/claude" "/Users/u/.local/bin/claude daemon run --origin transient" \
+  $ipid 1 "/Users/u/.local/bin/claude" "/Users/u/.local/bin/claude --agent hq" > "$procs"
+echo $dpid > "$(stf FA open)/$G12"   # запись версии 3.0.1: фоновая сессия под pid демона
+SESSYNC_TEST_PROCS=$procs SESSYNC_TEST_PPID=$spid resume FA $G11 -tmp-f startup
+check "фоновая сессия: в списке открытых pid bg-spare" test "$(cat "$(stf FA open)/$G11")" = $spid
+check "старая запись с pid демона убрана" test ! -e "$(stf FA open)/$G12"
+SESSYNC_TEST_PROCS=$procs SESSYNC_TEST_PPID=$hpid resume FA $G12 -tmp-f startup
+check "хук прямо под службой фоновых сессий — без записи" test ! -e "$(stf FA open)/$G12"
+SESSYNC_TEST_PROCS=$procs SESSYNC_TEST_PPID=$ipid resume FA $G12 -tmp-f startup
+check "обычный claude — его pid" test "$(cat "$(stf FA open)/$G12")" = $ipid
+kill $spid; wait $spid 2>/dev/null
+check "сессия остановлена, демон жив — forget удаляет сразу" has FA 'Готово' forget $G11 -y
+check "и файла нет" test ! -e "$f9/$G11.jsonl"
+kill $dpid $hpid $ipid; wait $dpid $hpid $ipid 2>/dev/null
+
 say FA -tmp-f $G6 "начало G6"
 run FA now >/dev/null; run FB now >/dev/null
 say FB -tmp-f $G6 "FB дописал, ещё не зная"
