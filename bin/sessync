@@ -184,10 +184,30 @@ load_env() {
       export RCLONE_CONFIG_STORE_TYPE=local
       case $p in /*) ;; *) p="$HOME/$p" ;; esac
     else
+      # One master connection, started here with its output closed, that rclone's ssh only joins
+      # (ControlMaster=no; without a master it connects on its own). The socket path is limited to
+      # ~104 bytes, and ssh adds a temporary suffix while creating it: a short private folder, not $st.
+      # A folder that isn't ours — no shared connection
+      local o="-o BatchMode=yes -o ConnectTimeout=10" sd
+      sd="${XDG_RUNTIME_DIR:-/tmp}/sessync-$(id -u)"
+      mkdir -p -m 700 "$sd" 2>/dev/null
+      if [ -d "$sd" ] && [ ! -L "$sd" ] && [ -O "$sd" ]; then
+        o="$o -o ControlPath=$sd/%C"
+        ssh $o -O check "$SSH_HOST" >/dev/null 2>&1 \
+          || ssh $o -fNM -o ControlPersist=120 "$SSH_HOST" </dev/null >/dev/null 2>&1
+        o="$o -o ControlMaster=no"
+      fi
       export RCLONE_CONFIG_STORE_TYPE=sftp RCLONE_CONFIG_STORE_SHELL_TYPE=unix \
-        RCLONE_CONFIG_STORE_SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$st/ssh-%C -o ControlPersist=60 $SSH_HOST"
+        RCLONE_CONFIG_STORE_SSH="ssh $o $SSH_HOST"
     fi
     R="store:$p"
+    # Files that come over sftp get the server's umask (644): the storage folder itself is kept 700,
+    # so nobody else on that machine reads what is in it
+    if ssh_local; then
+      mkdir -p -m 700 "$p" && chmod 700 "$p"
+    else
+      ssh $o "$SSH_HOST" "mkdir -p -m 700 -- $(printf '%q' "$p") && chmod 700 -- $(printf '%q' "$p")" </dev/null >/dev/null 2>&1
+    fi
   elif [ "$STORAGE" = rclone ]; then
     [ -n "$REMOTE" ] || return 1
     encrypted && { pp=$(secret passphrase) || return 1; }
