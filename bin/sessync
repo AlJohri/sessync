@@ -345,12 +345,13 @@ fix_retention() {
   retention_ok && return 0
   was=$("$PY" -I - "$cfg/settings.json" "$RETENTION" <<'PY'
 import json, os, shutil, sys, time
-# Through a symlink — into the file itself (settings.json is often a link into a dotfiles repo)
+# Through a symlink — into the file itself (settings.json is often a link into a dotfiles repo); the
+# backup goes next to the link, not into that repo
 p, want = os.path.realpath(sys.argv[1]), int(sys.argv[2])
 try:
     with open(p, encoding="utf-8") as f:
         d = json.load(f)
-    shutil.copy2(p, p + time.strftime(".bak-sessync-%Y%m%d-%H%M%S"))
+    shutil.copy2(p, sys.argv[1] + time.strftime(".bak-sessync-%Y%m%d-%H%M%S"))
 except FileNotFoundError:
     d = {}
 was = d.get("cleanupPeriodDays", 30)
@@ -869,8 +870,21 @@ hook_bin() {
   [ -n "$b" ] || b=$self
   echo "${b/#$HOME/~}"
 }
+# $1 — start | end: settings.json has a sessync hook of that kind whose command is there to run
+hook_ok() {
+  local k=SessionStart c p
+  [ "$1" = end ] && k=SessionEnd
+  c=$(jq -r --arg k "$k" --arg w "sessync hook $1" \
+    '[.hooks[$k][]?.hooks[]?.command // empty | select(contains($w))] | first // empty' "$cfg/settings.json" 2>/dev/null)
+  [ -n "$c" ] || return 1
+  p=$(printf '%s' "$c" | sed -n 's/^\[ -x \([^ ]*\) \].*/\1/p')   # "[ -x P ] && P hook start || true"
+  [ -n "$p" ] || p=${c%% *}
+  p=${p/#\~/$HOME}
+  [ -x "$p" ]
+}
+
 hooks() {
-  local settings="$cfg/settings.json" b hs he ok backup tmp
+  local settings="$cfg/settings.json" b hs he ok keep="" backup tmp
   command -v jq >/dev/null || { say "jq is needed: $(pkg_hint jq)" "Нужен jq: $(pkg_hint jq)"; return 1; }
   if [ "${1:-}" = remove ]; then
     [ -f "$settings" ] || return 0
@@ -883,20 +897,28 @@ hooks() {
     [ -f "$settings" ] || echo '{}' > "$settings"
     ok=$(jq --arg s "$hs" --arg e "$he" '
       ([.hooks.SessionStart[]?.hooks[]?.command] | index($s) != null)
-      and ([.hooks.SessionEnd[]?.hooks[]?.command] | index($e) != null)
-      and ([.hooks[]?[]?.hooks[]?.command // empty] | map(select(test("cc-sync hook"))) | length == 0)
-      and ((.cleanupPeriodDays // 30) >= 3650)' "$settings") \
+      and ([.hooks.SessionEnd[]?.hooks[]?.command] | index($e) != null)' "$settings") \
       || { say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
-    if [ "$ok" = true ]; then say "-- hooks already in place" "-- хуки уже на месте"; return 0; fi
+    # Hooks of sessync installed another way (a dotfiles repo, mise) are left as they are while the
+    # command in them exists: replacing them would rewrite a file someone keeps by hand
+    [ "$ok" = true ] || { hook_ok start && hook_ok end && ok=true; }
+    if [ "$ok" = true ] && jq -e '
+      ([.hooks[]?[]?.hooks[]?.command // empty] | map(select(test("cc-sync hook"))) | length == 0)
+      and ((.cleanupPeriodDays // 30) >= 3650)' "$settings" >/dev/null; then
+      say "-- hooks already in place" "-- хуки уже на месте"; return 0
+    fi
+    # Only the retention is low: it is raised, the hooks stay as they are (unless cc-sync's are there)
+    [ "$ok" = true ] && ! jq -e '[.hooks[]?[]?.hooks[]?.command // empty] | any(test("cc-sync hook"))' "$settings" >/dev/null && keep=true
   fi
   backup="$settings.bak-sessync-$(date +%Y%m%d-%H%M%S)"
   cp "$settings" "$backup"
   tmp="$settings.sessync.tmp"
   # Earlier entries of sessync (and of cc-sync, its old name) go, other hooks stay. Into a temporary
   # file first: a jq failure must not leave an empty settings.json
-  jq --arg s "$hs" --arg e "${he:-}" --argjson r "$RETENTION" '
+  jq --arg s "$hs" --arg e "${he:-}" --argjson r "$RETENTION" --arg keep "$keep" '
     def strip: map(.hooks = ((.hooks // []) | map(select((.command // "") | test("(cc-sync|sessync) hook") | not))))
                | map(select((.hooks | length) > 0));
+    if $keep == "true" then (if (.cleanupPeriodDays // 30) < 3650 then .cleanupPeriodDays = $r else . end) else
     .hooks //= {}
     | .hooks |= with_entries(.value |= strip) | .hooks |= with_entries(select((.value | length) > 0))
     | if $s == "" then (if (.hooks | length) == 0 then del(.hooks) else . end) else
@@ -904,10 +926,12 @@ hooks() {
         | .hooks.SessionEnd = ((.hooks.SessionEnd // []) + [{"hooks": [{"type": "command", "command": $e}]}])
         | if (.cleanupPeriodDays // 30) < 3650 then .cleanupPeriodDays = $r else . end
       end
+    end
   ' "$backup" > "$tmp" || { rm -f "$tmp"; say "!! settings.json not changed: jq could not parse it" "!! settings.json не изменён: jq не смог его разобрать"; return 1; }
   # cat, not mv: the file keeps its permissions, and a symlinked settings.json stays a symlink
   cat "$tmp" > "$settings"; rm -f "$tmp"
-  if [ -n "$hs" ]; then say "-- hooks added; previous file: ${backup/#$HOME/~}" "-- хуки добавлены; прежний файл: ${backup/#$HOME/~}"
+  if [ -n "$keep" ]; then say "-- session retention raised; previous file: ${backup/#$HOME/~}" "-- срок хранения сессий поднят; прежний файл: ${backup/#$HOME/~}"
+  elif [ -n "$hs" ]; then say "-- hooks added; previous file: ${backup/#$HOME/~}" "-- хуки добавлены; прежний файл: ${backup/#$HOME/~}"
   else say "-- hooks removed; previous file: ${backup/#$HOME/~}" "-- хуки убраны; прежний файл: ${backup/#$HOME/~}"; fi
 }
 

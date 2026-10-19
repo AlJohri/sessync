@@ -116,7 +116,9 @@ clears the clipboard at the end. The Passwords entry reaches your other devices 
 ### Linux, and storage on a machine of your own
 
 On Linux, install rclone, ripgrep and jq with the package manager, then run `install.sh` from git
-(there is no Homebrew formula). Secrets go to the Secret Service keyring (`secret-tool`),
+(there is no Homebrew formula). If sessync is already on PATH (installed with mise, say), or its
+hooks are already in `settings.json` (kept in a dotfiles repository), `install.sh` leaves them as
+they are and only raises `cleanupPeriodDays` when it is low. Secrets go to the Secret Service keyring (`secret-tool`),
 notifications to `notify-send`.
 
 `sessync setup` option 6 keeps the storage in a folder on a machine of your own, over ssh: one

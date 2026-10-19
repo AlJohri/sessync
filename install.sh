@@ -44,7 +44,20 @@ fi
 
 say "== 2/3 The sessync command in $bin" "== 2/3 Команда sessync в $bin"
 mkdir -p "$bin"
-ln -sf "$here/bin/sessync" "$bin/sessync"
+# sessync installed some other way (mise, a package) stays the one on PATH: no second copy here.
+# A file in $bin that isn't a link is someone's own — never replaced
+cmd="$bin/sessync"
+cur=$(command -v sessync 2>/dev/null || true)
+if [ -n "$cur" ] && [ "$cur" != "$bin/sessync" ]; then
+  say "-- sessync is already on PATH: $cur — no link in $bin" "-- sessync уже есть в PATH: $cur — ссылка в $bin не нужна"
+  cmd=$cur
+elif [ -e "$bin/sessync" ] && [ ! -L "$bin/sessync" ]; then
+  say "!! $bin/sessync is a file, not a link — left as it is; remove it and run again" \
+    "!! $bin/sessync — файл, а не ссылка — оставлен как есть; уберите его и запустите снова"
+  exit 1
+else
+  ln -sf "$here/bin/sessync" "$bin/sessync"
+fi
 # Before 2.0 the tool was cc-sync and cc-find: their links into this folder go
 for t in cc-sync cc-find; do
   if [ -L "$bin/$t" ]; then
@@ -58,10 +71,10 @@ case ":$PATH:" in
 esac
 
 say "== 3/3 Claude Code hooks and session retention" "== 3/3 Хуки Claude Code и срок хранения сессий"
-SESSYNC_BIN="$bin/sessync" "$here/bin/sessync" hooks install
+SESSYNC_BIN="$cmd" "$here/bin/sessync" hooks install
 
 echo
-if "$bin/sessync" status 2>/dev/null | grep -q 'sessync setup'; then
+if "$cmd" status 2>/dev/null | grep -q 'sessync setup'; then
   say "Next: in your own terminal, sessync setup, then sessync" "Дальше: в своём терминале sessync setup, затем sessync"
 else
   say "Done. Check: sessync status" "Готово. Проверить: sessync status"

@@ -810,6 +810,7 @@ printf '{"cleanupPeriodDays": 30}\n' > "$T/dotfiles/settings.json"; chmod 644 "$
 ln -s "$T/dotfiles/settings.json" "$T/H/settings.json"
 run H now >/dev/null
 check "срок хранения: settings.json-ссылка осталась ссылкой" test -L "$T/H/settings.json"
+check "срок хранения: копия рядом со ссылкой, не в папке dotfiles" sh -c "! ls '$T/dotfiles' | grep -q bak-sessync && ls '$T/H' | grep -q 'settings.json.bak-sessync'"
 check "срок хранения: записан в файл по ссылке, права прежние" sh -c "jq -e '.cleanupPeriodDays == 36500' '$T/dotfiles/settings.json' && test '$(perm "$T/dotfiles/settings.json")' = 644"
 if [ "$(uname)" = Darwin ]; then
 pb="sessync-test-$$"
@@ -996,7 +997,9 @@ cat > "$H/.claude/settings.json" <<'JSON'
 }
 JSON
 ln -s "$here/bin/cc-sync" "$H/.local/bin/cc-sync"; ln -s "$here/bin/cc-find" "$H/.local/bin/cc-find"   # версия до 2.0
-inst() { HOME="$H" CLAUDE_CONFIG_DIR="$H/.claude" SESSYNC_SKIP_BREW=1 "$here/$1"; }
+# PATH без sessync: install.sh не должен находить sessync, установленный на этой машине
+nosess() { printf '%s' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -x "$d/sessync" ] || printf '%s:' "$d"; done | sed 's/:$//'; }
+inst() { HOME="$H" CLAUDE_CONFIG_DIR="$H/.claude" SESSYNC_SKIP_BREW=1 PATH="$(nosess)" "$here/$1"; }
 check "install.sh" inst install.sh
 s="$H/.claude/settings.json"
 check "hook старта добавлен" jq -e '[.hooks.SessionStart[].hooks[].command] | any(test("sessync hook start"))' "$s"
@@ -1006,7 +1009,7 @@ check "чужие hook'и на месте" jq -e '([.hooks.SessionStart[].hooks[
 check "срок хранения поднят" jq -e '.cleanupPeriodDays == 36500' "$s"
 check "команда в ~/.local/bin" test -L "$H/.local/bin/sessync"
 check "старые команды cc-sync и cc-find убраны" test ! -L "$H/.local/bin/cc-sync" -a ! -L "$H/.local/bin/cc-find"
-check "повторный install.sh ничего не меняет" sh -c "HOME='$H' CLAUDE_CONFIG_DIR='$H/.claude' SESSYNC_SKIP_BREW=1 '$here/install.sh' | grep -q 'уже на месте'"
+check "повторный install.sh ничего не меняет" sh -c "HOME='$H' CLAUDE_CONFIG_DIR='$H/.claude' SESSYNC_SKIP_BREW=1 PATH='$(nosess)' '$here/install.sh' | grep -q 'уже на месте'"
 check "uninstall.sh" inst uninstall.sh
 check "hook'и sessync убраны" jq -e '[.hooks[]?[]?.hooks[]?.command] | all(test("sessync") | not)' "$s"
 check "чужие hook'и остались" jq -e '([.hooks.SessionStart[].hooks[].command] | index("echo чужой hook")) and .hooks.Stop' "$s"
@@ -1019,6 +1022,31 @@ check "install.sh: hook записан в файл по ссылке" jq -e '[.h
 rm "$s"; printf '{ "model": "opus", сломано\n' > "$s"
 check "install.sh: settings.json с ошибкой — отказ" not inst install.sh
 check "install.sh: settings.json с ошибкой не тронут" grep -q 'сломано' "$s"
+
+echo "== install.sh рядом с dotfiles и mise: чужие файлы не переписывает"
+H2="$T/home2"; mkdir -p "$H2/.claude" "$H2/.local/bin" "$H2/mise/bin"
+ln -s "$here/bin/sessync" "$H2/mise/bin/sessync"   # sessync поставлен через mise
+cat > "$T/dotfiles/s3.json" <<'JSON'
+{"cleanupPeriodDays": 36500,
+ "hooks": {"SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": "[ -x ~/mise/bin/sessync ] && ~/mise/bin/sessync hook start || true"}]}],
+           "SessionEnd": [{"hooks": [{"type": "command", "command": "[ -x ~/mise/bin/sessync ] && ~/mise/bin/sessync hook end || true"}]}]}}
+JSON
+cp "$T/dotfiles/s3.json" "$T/s3.orig"; ln -s "$T/dotfiles/s3.json" "$H2/.claude/settings.json"
+inst2() { HOME="$H2" CLAUDE_CONFIG_DIR="$H2/.claude" SESSYNC_SKIP_BREW=1 PATH="$H2/mise/bin:$(nosess)" "$here/$1"; }
+check "install.sh: sessync уже в PATH" inst2 install.sh
+check "ссылки в ~/.local/bin нет" test ! -e "$H2/.local/bin/sessync"
+check "свои hook'и sessync не переписаны" cmp -s "$T/dotfiles/s3.json" "$T/s3.orig"
+jq '.cleanupPeriodDays = 30' "$T/s3.orig" > "$T/dotfiles/s3.json"
+check "install.sh: низкий срок хранения" inst2 install.sh
+check "срок хранения поднят, hook'и прежние" jq -e '.cleanupPeriodDays == 36500 and ([.hooks.SessionStart[].hooks[].command] == ["[ -x ~/mise/bin/sessync ] && ~/mise/bin/sessync hook start || true"])' "$T/dotfiles/s3.json"
+check "копия settings.json — рядом со ссылкой, не в dotfiles" sh -c "ls '$H2/.claude' | grep -q 'settings.json.bak-sessync' && ! ls '$T/dotfiles' | grep -q 's3.json.bak'"
+check "settings.json-ссылка осталась ссылкой" test -L "$H2/.claude/settings.json"
+rm "$H2/mise/bin/sessync"   # команды из hook'а больше нет
+check "install.sh: hook на несуществующую команду" inst2 install.sh
+check "hook заменён на рабочий" jq -e '[.hooks.SessionStart[].hooks[].command] | any(test("local/bin/sessync hook start")) and all(test("mise/bin") | not)' "$T/dotfiles/s3.json"
+H3="$T/home3"; mkdir -p "$H3/.claude" "$H3/.local/bin"; printf '#!/bin/sh\necho своё\n' > "$H3/.local/bin/sessync"; chmod +x "$H3/.local/bin/sessync"
+check "install.sh: файл вместо ссылки — отказ" not env HOME="$H3" CLAUDE_CONFIG_DIR="$H3/.claude" SESSYNC_SKIP_BREW=1 PATH="$(nosess)" "$here/install.sh"
+check "свой файл не тронут" grep -q своё "$H3/.local/bin/sessync"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "Все проверки прошли"; else echo "Не прошло: $fails"; exit 1; fi

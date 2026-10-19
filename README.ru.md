@@ -119,7 +119,9 @@ Dropbox, OneDrive, SFTP, WebDAV/Nextcloud, NAS. Хранилище rclone сна
 ### Linux и хранилище на своей машине
 
 На Linux поставьте rclone, ripgrep и jq менеджером пакетов и запустите `install.sh` из git (формулы
-Homebrew нет). Секреты хранятся в связке ключей Secret Service (`secret-tool`), уведомления — через
+Homebrew нет). Если sessync уже есть в PATH (например, поставлен через mise) или его хуки уже есть в
+`settings.json` (который хранится в репозитории dotfiles), `install.sh` их не трогает и только
+поднимает `cleanupPeriodDays`, если он мал. Секреты хранятся в связке ключей Secret Service (`secret-tool`), уведомления — через
 `notify-send`.
 
 Пункт 6 в `sessync setup` держит хранилище в папке на вашей собственной машине, по ssh: папка на

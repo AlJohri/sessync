@@ -13,6 +13,11 @@
 - `ENCRYPT=off`, offered only for `STORAGE=ssh`: the storage keeps the files as they are and no
   password is needed. A storage written with encryption and one without refuse each other.
 - The background sync runs every 5 minutes instead of 10 (`INTERVAL`, seconds).
+- `install.sh` leaves files it doesn't own alone. A `sessync` already on PATH (mise, a package)
+  gets no second link in `~/.local/bin`, and a regular file there is never replaced. sessync hooks
+  already in `settings.json` stay as they are while their command exists; only a low
+  `cleanupPeriodDays` is raised. The backup of a symlinked `settings.json` goes next to the link,
+  not into the repository it points to.
 - Tests run on Linux too.
 
 ## 3.0.2 — 2026-10-15
