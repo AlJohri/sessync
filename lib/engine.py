@@ -230,8 +230,10 @@ def place_new(src, dst):
 
 
 def ignored(name):
-    """Not synced: macOS service files and sessync temporary files."""
-    return name == ".DS_Store" or name.endswith(".sessync.tmp")
+    """Not synced: macOS service files, sessync temporary files, and bridge-pointer.json — Claude Code's
+    Remote Control pointer to the process and session of this machine, which another machine's copy
+    would replace."""
+    return name in (".DS_Store", "bridge-pointer.json") or name.endswith(".sessync.tmp")
 
 
 def unsafe(key):

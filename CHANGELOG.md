@@ -19,6 +19,8 @@
   `cleanupPeriodDays` is raised. The backup of a symlinked `settings.json` goes next to the link,
   not into the repository it points to.
 - Tests run on Linux too.
+- Fix: `bridge-pointer.json` in a project folder is not synced. It is Claude Code's Remote Control
+  pointer to this machine's process and session, and another machine's copy replaced it.
 
 ## 3.0.2 — 2026-10-15
 

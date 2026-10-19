@@ -60,6 +60,8 @@ mac A; mac B
 for i in 1 2 3 4; do say A -tmp-p1 "s$i" "привет из A номер $i"; done
 say A -tmp-p1 s5 "уникальнаяфраза для поиска"
 mkdir -p "$T/A/projects/-tmp-p1/memory" && echo "память A" > "$T/A/projects/-tmp-p1/memory/MEMORY.md"
+echo '{"pid":111}' > "$T/A/projects/-tmp-p1/bridge-pointer.json"   # Remote Control: процесс этой машины
+mkdir -p "$T/B/projects/-tmp-p1" && echo '{"pid":222}' > "$T/B/projects/-tmp-p1/bridge-pointer.json"
 mkdir -p "$T/A/projects/-tmp-p1/s1/tool-results"   # вложения сессий
 for i in 1 2 3; do echo "вывод команды $i" > "$T/A/projects/-tmp-p1/s1/tool-results/r$i.txt"; done
 echo '{"display":"промпт A","timestamp":1}' > "$T/A/history.jsonl"
@@ -70,6 +72,8 @@ check "в хранилище нет открытых имён" absent "$T/s3" "-
 check "B: первая синхронизация" run B now
 check "B получил сессии" test -f "$T/B/projects/-tmp-p1/s4.jsonl"
 check "memory/ не синхронизируется" test ! -e "$T/B/projects/-tmp-p1/memory"
+check "bridge-pointer.json не синхронизируется: у B свой" grep -q 222 "$T/B/projects/-tmp-p1/bridge-pointer.json"
+check "bridge-pointer.json: копии конфликта нет" sh -c "! find '$T/B/projects' -name 'bridge-pointer.json.conflict*' | grep -q ."
 check "B получил вложения сессий" test -f "$T/B/projects/-tmp-p1/s1/tool-results/r3.txt"
 check "B: история промптов объединена" contains "$T/B/history.jsonl" "промпт A"
 run A now >/dev/null
@@ -740,11 +744,13 @@ echo "== Хранилище по ssh на своей машине, без шиф
 for m in N1 N2; do mac $m; printf 'STORAGE=ssh\nSSH_HOST=localhost\nSSH_PATH=%s\nENCRYPT=off\n' "$T/ssh-store" > "$T/$m/config/sessync/config"; done
 nopw() { SESSYNC_TEST_PASSPHRASE= ss "$@"; }   # пароля нет нигде
 say N1 -tmp-pl p1 "открытым текстом"
+echo '{"pid":333}' > "$T/N1/projects/-tmp-pl/bridge-pointer.json"
 check "N1: синхронизация без пароля" nopw N1 now
 nopw N2 now >/dev/null
 check "N2: получил сессию" contains "$T/N2/projects/-tmp-pl/p1.jsonl" "открытым текстом"
 check "в хранилище — открытый текст" grep -rqF "открытым текстом" "$T/ssh-store/v1"
 check "в хранилище — открытые имена" test -d "$T/ssh-store/v1/projects/-tmp-pl"
+check "bridge-pointer.json в хранилище не попал" sh -c "! find '$T/ssh-store' -name 'bridge-pointer*' | grep -q ."
 say N2 -tmp-pl p1 "дописано на N2"
 nopw N2 now >/dev/null; nopw N1 now >/dev/null
 check "N1: дописанное на N2 пришло" contains "$T/N1/projects/-tmp-pl/p1.jsonl" "дописано на N2"
