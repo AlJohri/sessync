@@ -25,8 +25,13 @@ if [ "${1:-}" = --purge ]; then
   svc=sessync
   [ -f "$conf" ] && svc=$(sed -n 's/^KEYCHAIN_SERVICE=//p' "$conf" | tail -1) && svc=${svc:-sessync}
   for a in s3-access-key s3-secret-key passphrase; do
-    security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 \
-      && say "-- removed from the Keychain: $a" "-- из Связки ключей удалено: $a"
+    if [ "$(uname)" = Darwin ]; then
+      security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 \
+        && say "-- removed from the Keychain: $a" "-- из Связки ключей удалено: $a"
+    elif command -v secret-tool >/dev/null && secret-tool lookup service "$svc" account "$a" >/dev/null 2>&1; then
+      secret-tool clear service "$svc" account "$a" \
+        && say "-- removed from the keyring: $a" "-- из связки ключей удалено: $a"
+    fi
   done
   rm -rf "$st" "$conf" "${XDG_CACHE_HOME:-$HOME/.cache}/sessync"
   say "-- storage settings, local state and the search index removed" "-- удалены настройки хранилища, локальное состояние и индекс поиска"

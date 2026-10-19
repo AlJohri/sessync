@@ -5,7 +5,7 @@
 # What: ~/.claude/projects (transcripts, their attachments, subagent sessions; not memory/ folders)
 # and ~/.claude/history.jsonl (prompt history, merged line by line). Transcripts and history are only
 # appended to, so only the appended lines travel; attachments go whole (lib/engine.py over rclone crypt).
-# When: Claude Code hooks at session start and end, plus every 10 minutes while any claude is open.
+# When: Claude Code hooks at session start and end, plus every 5 minutes while any claude is open.
 # When the last claude closes, the background loop ends by itself.
 set -u
 VERSION=3.0.2
@@ -33,18 +33,24 @@ FORMAT=3
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 PY=${SESSYNC_PYTHON:-python3}   # python 3.9 or newer; the tests also run /usr/bin/python3
 
-STORAGE="" PROVIDER=Other ENDPOINT="" REGION="" BUCKET="" REMOTE="" INTERVAL=600
-KEYCHAIN_SERVICE=sessync TRASH_DAYS=30 UI_LANG="" RESUME_CHECK=on""
+STORAGE="" PROVIDER=Other ENDPOINT="" REGION="" BUCKET="" REMOTE="" SSH_HOST="" SSH_PATH="" INTERVAL=300
+KEYCHAIN_SERVICE=sessync TRASH_DAYS=30 UI_LANG="" RESUME_CHECK=on"" ENCRYPT=on
 if [ -f "$conf" ]; then
   while IFS='=' read -r k v; do
     v=${v%\"}; v=${v#\"}
     case "$k" in
-      STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|INTERVAL|KEYCHAIN_SERVICE|TRASH_DAYS|RESUME_CHECK) printf -v "$k" '%s' "$v" ;;
+      STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|SSH_HOST|SSH_PATH|INTERVAL|KEYCHAIN_SERVICE|TRASH_DAYS|RESUME_CHECK|ENCRYPT) printf -v "$k" '%s' "$v" ;;
       LANGUAGE) UI_LANG=$v ;;
     esac
   done < <(grep -E '^[A-Z_]+=' "$conf")
 fi
-[ -n "$STORAGE" ] || { if [ -n "$REMOTE" ]; then STORAGE=rclone; else STORAGE=s3; fi; }
+if [ -z "$STORAGE" ]; then
+  if [ -n "$SSH_HOST" ]; then STORAGE=ssh; elif [ -n "$REMOTE" ]; then STORAGE=rclone; else STORAGE=s3; fi
+fi
+OS=$(uname -s)
+# ENCRYPT=off: the storage holds the files as they are, with no password (only for storage of your own)
+encrypted() { [ "$ENCRYPT" != off ]; }
+storage_set() { [ -n "$BUCKET$REMOTE$SSH_HOST" ]; }
 
 # Interface language: SESSYNC_LANG, LANGUAGE in the config, the locale, the macOS language. en | ru
 ui_lang() {
@@ -65,6 +71,10 @@ TEST_REMOTE="${SESSYNC_TEST_REMOTE:-}"
 log() { mkdir -p "$st"; chmod 700 "$st"; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$logf"; }
 notify() {  # the text is an argument, not part of the script: it may hold a session's title
   [ -n "$TEST_REMOTE" ] && return 0
+  if [ "$OS" != Darwin ]; then
+    command -v notify-send >/dev/null && notify-send -a sessync sessync "$1" >/dev/null 2>&1
+    return 0
+  fi
   # terminal-notifier 3 (UserNotifications) when installed: osascript notifications are unreliable on macOS 26
   local tn
   for tn in /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier; do
@@ -82,14 +92,26 @@ secret() {
     else [ -n "${SESSYNC_TEST_KEYCHAIN:-}" ] && cat "$SESSYNC_TEST_KEYCHAIN/$1" 2>/dev/null; fi
     return
   fi
+  if [ "$OS" != Darwin ]; then
+    secret-tool lookup service "$KEYCHAIN_SERVICE" account "$1" 2>/dev/null
+    return
+  fi
   security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null
 }
+
+# Where secrets are kept, for messages: the Keychain on macOS, the Secret Service keyring elsewhere
+kc_in() { if [ "$OS" = Darwin ]; then t "in the Keychain" "в Связке ключей"; else t "in the keyring" "в связке ключей"; fi; }
+kc_to() { if [ "$OS" = Darwin ]; then t "to the Keychain" "в Связку ключей"; else t "to the keyring" "в связку ключей"; fi; }
 
 # The secret goes to security through stdin, not as an argument: not visible in the process list
 kc_set() {
   if [ -n "$TEST_REMOTE" ]; then   # tests never reach the real Keychain
     [ -n "${SESSYNC_TEST_KEYCHAIN:-}" ] && mkdir -p "$SESSYNC_TEST_KEYCHAIN" \
       && printf '%s\n' "$2" > "$SESSYNC_TEST_KEYCHAIN/$1"
+    return
+  fi
+  if [ "$OS" != Darwin ]; then
+    printf '%s' "$2" | secret-tool store --label="sessync $1" service "$KEYCHAIN_SERVICE" account "$1"
     return
   fi
   local v=${2//\\/\\\\}
@@ -103,6 +125,14 @@ kc_set() {
 # Empty stdin clears the clipboard. Tests use a separate named pasteboard, never the real one
 clip() {
   [ -n "$TEST_REMOTE" ] && [ -z "${SESSYNC_TEST_PASTEBOARD:-}" ] && return 1
+  if [ "$OS" != Darwin ]; then   # Wayland; --sensitive keeps it out of clipboard history
+    local s
+    s=$(cat)
+    # tests: SESSYNC_TEST_PASTEBOARD is a file — Linux has no named pasteboards
+    [ -n "$TEST_REMOTE" ] && { printf '%s' "$s" > "$SESSYNC_TEST_PASTEBOARD"; return; }
+    if [ -n "$s" ]; then printf '%s' "$s" | wl-copy --sensitive; else wl-copy --clear; fi
+    return
+  fi
   osascript -l JavaScript -e '
 function run(argv) {
   ObjC.import("AppKit");
@@ -127,25 +157,47 @@ set_error() {
 }
 
 storage_desc() {
-  if [ "$STORAGE" = rclone ]; then echo "rclone $REMOTE"
+  if [ "$STORAGE" = ssh ]; then echo "ssh $SSH_HOST:${SSH_PATH:-sessync}"
+  elif [ "$STORAGE" = rclone ]; then echo "rclone $REMOTE"
   elif [ -n "$ENDPOINT" ]; then echo "$(t bucket бакет) $BUCKET ($ENDPOINT)"
   else echo "$(t bucket бакет) $BUCKET (AWS ${REGION:-?})"; fi
 }
 
+# The storage host of STORAGE=ssh is this machine: its folder is used directly, not through ssh
+ssh_local() {
+  [ "$SSH_HOST" = localhost ] && return 0
+  [ "$SSH_HOST" = "$(hostname -s 2>/dev/null || uname -n)" ]
+}
+
 load_env() {
-  local ak sk pp ob
+  local ak sk pp="" ob p
   mkdir -p "$st"; chmod 700 "$st"   # check_key logs here; on a new Mac setup runs before any sync
-  if [ "$STORAGE" = rclone ]; then
+  if [ "$STORAGE" = ssh ]; then
+    # A folder on a machine of your own, over ssh (its config, keys and agent; BatchMode: never asks).
+    # The connection is shared between rclone's calls of a run (ControlMaster)
+    [ -n "$SSH_HOST" ] || return 1
+    p=${SSH_PATH:-sessync}
+    encrypted && { pp=$(secret passphrase) || return 1; }
+    [ -f "$st/rclone.conf" ] || : > "$st/rclone.conf"
+    export RCLONE_CONFIG="$st/rclone.conf"
+    if ssh_local; then
+      export RCLONE_CONFIG_STORE_TYPE=local
+      case $p in /*) ;; *) p="$HOME/$p" ;; esac
+    else
+      export RCLONE_CONFIG_STORE_TYPE=sftp RCLONE_CONFIG_STORE_SHELL_TYPE=unix \
+        RCLONE_CONFIG_STORE_SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$st/ssh-%C -o ControlPersist=60 $SSH_HOST"
+    fi
+    R="store:$p"
+  elif [ "$STORAGE" = rclone ]; then
     [ -n "$REMOTE" ] || return 1
-    pp=$(secret passphrase) || return 1
+    encrypted && { pp=$(secret passphrase) || return 1; }
     R=${REMOTE%/}     # the user's own rclone config: Google Drive, Dropbox, SFTP, WebDAV…
   else
     [ -n "$BUCKET" ] || return 1
-    if [ -n "$TEST_REMOTE" ]; then
-      pp=$(secret passphrase) || return 1
-    else
-      ak=$(secret s3-access-key) && sk=$(secret s3-secret-key) && pp=$(secret passphrase) || return 1
+    if [ -z "$TEST_REMOTE" ]; then
+      ak=$(secret s3-access-key) && sk=$(secret s3-secret-key) || return 1
     fi
+    encrypted && { pp=$(secret passphrase) || return 1; }
     [ -f "$st/rclone.conf" ] || : > "$st/rclone.conf"
     export RCLONE_CONFIG="$st/rclone.conf"   # only the remotes below, nothing from the user's config
     if [ -n "$TEST_REMOTE" ]; then
@@ -159,6 +211,13 @@ load_env() {
       [ "$PROVIDER" = AWS ] || export RCLONE_CONFIG_STORE_FORCE_PATH_STYLE=true
       R="store:$BUCKET"
     fi
+  fi
+  if ! encrypted; then
+    # The same layout with no crypt: ss: and ssk: are plain folders. An encrypted storage's check file
+    # (keycheck.bin) is not keycheck, and a plain one can't be decrypted — check_key refuses a mix
+    export RCLONE_CONFIG_SS_TYPE=alias RCLONE_CONFIG_SS_REMOTE="$R/v1"
+    export RCLONE_CONFIG_SSK_TYPE=alias RCLONE_CONFIG_SSK_REMOTE="$R/v1-check"
+    return 0
   fi
   ob=$(printf '%s\n' "$pp" | rclone obscure -) || return 1
   # ss: — the data (contents and names encrypted); ssk: — the check file with a plain name, which
@@ -180,8 +239,8 @@ check_key() {
   if rclone lsf "$R/v1-check/" 2>/dev/null | grep -q .; then
     c=$(rclone cat ssk:keycheck 2>/dev/null)
     if [ "${c%%$'\n'*}" != "$CHECK_TEXT" ]; then
-      set_error "$(t "the encryption password is not the one used on your other Macs (sessync setup)" \
-        "пароль шифрования не тот, что на других Mac (sessync setup)")"
+      set_error "$(t "the encryption password (or ENCRYPT) is not the one used on your other Macs (sessync setup)" \
+        "пароль шифрования не тот (или ENCRYPT не тот), что на других Mac (sessync setup)")"
       return 1
     fi
     f=$(printf '%s\n' "$c" | sed -n 's/^format \([0-9][0-9]*\)$/\1/p')
@@ -200,7 +259,7 @@ check_key() {
     fi
   else
     # a folder on an rclone remote (gdrive:sessync) may not exist yet; a bucket is created by the user
-    [ "$STORAGE" = rclone ] && rclone mkdir "$R" 2>/dev/null
+    [ "$STORAGE" = s3 ] || rclone mkdir "$R" 2>/dev/null
     if ! rclone lsf "$R" >/dev/null 2>&1; then
       set_error "$(t "no access to the storage ($(storage_desc)): network or keys" \
         "нет доступа к хранилищу ($(storage_desc)): сеть или ключи")"
@@ -302,8 +361,13 @@ PY
 host_id() {
   local n u
   [ -n "${SESSYNC_HOST:-}" ] && { echo "$SESSYNC_HOST"; return; }
-  n=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
-  u=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4 }')
+  if [ "$OS" = Darwin ]; then
+    n=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+    u=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4 }')
+  else   # hostname is optional on some distributions; /etc/machine-id is set at install
+    n=$(hostname -s 2>/dev/null || uname -n)
+    u=$(tr a-f A-F < /etc/machine-id 2>/dev/null)   # upper case, as IOPlatformUUID
+  fi
   echo "$n${u:+-${u:0:8}}"
 }
 
@@ -577,7 +641,7 @@ sync_all() {
 }
 
 sync_locked() {
-  if ! command -v rclone >/dev/null; then set_error "$(t "rclone is missing (brew install rclone)" "нет rclone (brew install rclone)")"; return 1; fi
+  if ! command -v rclone >/dev/null; then set_error "$(t "rclone is missing ($(pkg_hint rclone))" "нет rclone ($(pkg_hint rclone))")"; return 1; fi
   if ! fix_retention; then
     set_error "$(t "settings.json can't be read — retention can't be checked" "settings.json не читается — срок хранения не проверить")"
     return 1
@@ -669,6 +733,15 @@ sync_locked() {
 
 kb() { echo "$(( ($1 + 1023) / 1024 )) $(t KB КБ)"; }
 
+# How to install a package here: Homebrew on macOS, the system's package manager elsewhere
+pkg_hint() {
+  if [ "$OS" = Darwin ]; then echo "brew install $*"
+  elif command -v pacman >/dev/null; then echo "sudo pacman -S $*"
+  elif command -v apt-get >/dev/null; then echo "sudo apt-get install $*"
+  elif command -v dnf >/dev/null; then echo "sudo dnf install $*"
+  else echo "install: $*"; fi
+}
+
 # claude -r: Claude Code read the session's file before this hook ran, so lines written for it on
 # another Mac since this Mac's last sync are not on screen. A quick check of this one session (a
 # second or so; Claude's first answer waits for the hook) says so; the whole sync then goes on in the
@@ -751,7 +824,7 @@ ask_secret() {  # $1 — Keychain entry, $2 — prompt
     printf '%s: ' "$2"
   fi
   read -rs v; echo
-  [ -z "$v" ] || kc_set "$1" "$v" || { say "!! Could not save to the Keychain: $1" "!! Не удалось сохранить в Связку ключей: $1"; return 1; }
+  [ -z "$v" ] || kc_set "$1" "$v" || { say "!! Could not save $(kc_to): $1" "!! Не удалось сохранить $(kc_to): $1"; return 1; }
 }
 
 # Result for a person; code 75 — a sync was already running (it will run again itself), not an error
@@ -778,7 +851,7 @@ hook_bin() {
 }
 hooks() {
   local settings="$cfg/settings.json" b hs he ok backup tmp
-  command -v jq >/dev/null || { say "jq is needed: brew install jq" "Нужен jq: brew install jq"; return 1; }
+  command -v jq >/dev/null || { say "jq is needed: $(pkg_hint jq)" "Нужен jq: $(pkg_hint jq)"; return 1; }
   if [ "${1:-}" = remove ]; then
     [ -f "$settings" ] || return 0
     jq -e '[.hooks[]?[]?.hooks[]?.command // empty] | any(test("(cc-sync|sessync) hook"))' "$settings" >/dev/null || return 0
@@ -875,7 +948,9 @@ setup_storage() {
   say "  4) Other S3-compatible storage (by its endpoint)" "  4) Другое S3-совместимое хранилище (по адресу endpoint)"
   say "  5) Any rclone remote: Google Drive, Dropbox, OneDrive, SFTP, WebDAV… (set it up first: rclone config)" \
     "  5) Любое хранилище rclone: Google Drive, Dropbox, OneDrive, SFTP, WebDAV… (сначала: rclone config)"
-  read -rp "$(t 'Choice [1-5]: ' 'Выбор [1-5]: ')" c
+  say "  6) A folder on a machine of your own, over ssh (its ssh config and keys; the machine itself uses the folder directly)" \
+    "  6) Папка на вашей собственной машине, по ssh (её настройки ssh и ключи; сама машина работает с папкой напрямую)"
+  read -rp "$(t 'Choice [1-6]: ' 'Выбор [1-6]: ')" c
   case $c in
     1) read -rp "$(t 'Cloudflare account ID (R2 → Overview, right column): ' 'ID аккаунта Cloudflare (R2 → Overview, справа): ')" v
        [ -n "$v" ] || return 1
@@ -895,8 +970,21 @@ setup_storage() {
        read -rp "$(t 'Remote and folder (e.g. gdrive:sessync): ' 'Хранилище и папка (например, gdrive:sessync): ')" v
        case $v in *:*) ;; *) say "Needs a remote name and a colon, as in rclone listremotes" "Нужно имя хранилища с двоеточием, как в rclone listremotes"; return 1 ;; esac
        STORAGE=rclone REMOTE="$v" PROVIDER="" ENDPOINT="" REGION="" BUCKET="" ;;
+    6) read -rp "$(t 'Host, as you reach it with ssh (on that machine itself — its own name): ' 'Хост, как вы заходите на него по ssh (на самой этой машине — её имя): ')" v
+       [ -n "$v" ] || return 1
+       SSH_HOST=$v
+       read -rp "$(t 'Folder on it, from its home folder [sessync]: ' 'Папка на нём, от домашней папки [sessync]: ')" v
+       STORAGE=ssh SSH_PATH="${v:-sessync}" REMOTE="" PROVIDER="" ENDPOINT="" REGION="" BUCKET=""
+       if ! ssh_local && ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" true 2>/dev/null; then
+         say "No ssh to $SSH_HOST without a password prompt — set up keys first" "Нет ssh на $SSH_HOST без запроса пароля — сначала настройте ключи"
+         return 1
+       fi
+       # A machine of your own: encryption is a choice. Every other storage is someone else's — always encrypted
+       read -rp "$(t 'Encrypt the sessions in the storage? [Y/n]: ' 'Шифровать сессии в хранилище? [Y/n]: ')" v
+       case $v in [nNнН]*) ENCRYPT=off ;; *) ENCRYPT=on ;; esac ;;
     *) return 1 ;;
   esac
+  [ "$STORAGE" = ssh ] || ENCRYPT=on
   if [ "$STORAGE" = s3 ]; then
     say "Create a private bucket for the sessions only, and keys with access to this bucket only." \
       "Создайте приватный бакет только для сессий и ключи с доступом только к нему."
@@ -906,9 +994,9 @@ setup_storage() {
   fi
   mkdir -p "$(dirname "$conf")"
   # The other lines (KEYCHAIN_SERVICE, TRASH_DAYS, INTERVAL) stay
-  { grep -vE '^(STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|LANGUAGE)=' "$conf" 2>/dev/null
-    printf 'STORAGE=%s\nPROVIDER=%s\nENDPOINT=%s\nREGION=%s\nBUCKET=%s\nREMOTE=%s\nLANGUAGE=%s\n' \
-      "$STORAGE" "$PROVIDER" "$ENDPOINT" "$REGION" "$BUCKET" "$REMOTE" "$UI"; } > "$conf.tmp" \
+  { grep -vE '^(STORAGE|PROVIDER|ENDPOINT|REGION|BUCKET|REMOTE|SSH_HOST|SSH_PATH|ENCRYPT|LANGUAGE)=' "$conf" 2>/dev/null
+    printf 'STORAGE=%s\nPROVIDER=%s\nENDPOINT=%s\nREGION=%s\nBUCKET=%s\nREMOTE=%s\nSSH_HOST=%s\nSSH_PATH=%s\nENCRYPT=%s\nLANGUAGE=%s\n' \
+      "$STORAGE" "$PROVIDER" "$ENDPOINT" "$REGION" "$BUCKET" "$REMOTE" "$SSH_HOST" "$SSH_PATH" "$ENCRYPT" "$UI"; } > "$conf.tmp" \
     && cat "$conf.tmp" > "$conf"; rm -f "$conf.tmp"
   say "Saved to ${conf/#$HOME/~}" "Сохранено в ${conf/#$HOME/~}"
 }
@@ -1096,7 +1184,7 @@ case "${1:-now}" in
     echo $$ > "$st/loop.pid"
     while sleep "$INTERVAL"; do
       [ -f "$st/off" ] && break
-      pgrep -xq claude || break     # the last session closed — the loop ends by itself
+      pgrep -x claude >/dev/null || break   # the last session closed — the loop ends by itself (procps has no -q)
       "$self" _run
     done
     rm -f "$st/loop.pid" ;;
@@ -1104,8 +1192,9 @@ case "${1:-now}" in
   find) shift; SESSYNC_HOME_CANON=$(canon_home) exec "$PY" -I "$LIB/find.py" "$@" ;;
 
   status)
-    if [ -n "$BUCKET$REMOTE" ]; then say "Storage: $(storage_desc), encrypted on this Mac" "Хранилище: $(storage_desc), данные зашифрованы на Mac"
-    else say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"; fi
+    if ! storage_set; then say "Storage is not set up: sessync setup" "Хранилище не настроено: sessync setup"
+    elif encrypted; then say "Storage: $(storage_desc), encrypted on this Mac" "Хранилище: $(storage_desc), данные зашифрованы на Mac"
+    else say "Storage: $(storage_desc), not encrypted (ENCRYPT=off)" "Хранилище: $(storage_desc), без шифрования (ENCRYPT=off)"; fi
     if [ -f "$st/off" ]; then say "Automatic sync: OFF (turn on: sessync on)" "Автосинхронизация: ВЫКЛЮЧЕНА (включить: sessync on)"
     else say "Automatic sync: on — session start and end, every $((INTERVAL / 60)) min while claude is open" \
       "Автосинхронизация: включена — при запуске и закрытии сессии и раз в $((INTERVAL / 60)) мин, пока открыт claude"; fi
@@ -1136,10 +1225,12 @@ case "${1:-now}" in
     say "Here: $sessions sessions, $(du -sh "$cfg/projects" 2>/dev/null | cut -f1)" "Локально: сессий $sessions, $(du -sh "$cfg/projects" 2>/dev/null | cut -f1)"
     if [ "$STORAGE" = s3 ] && [ -n "$BUCKET" ] && [ -z "$TEST_REMOTE" ]; then
       for a in s3-access-key s3-secret-key; do
-        secret "$a" >/dev/null || say "Not in the Keychain: $a — sessync setup" "Нет в Связке ключей: $a — sessync setup"
+        secret "$a" >/dev/null || say "Not $(kc_in): $a — sessync setup" "Нет $(kc_in): $a — sessync setup"
       done
     fi
-    secret passphrase >/dev/null || say "Not in the Keychain: passphrase — sessync setup" "Нет в Связке ключей: passphrase — sessync setup"
+    if encrypted; then
+      secret passphrase >/dev/null || say "Not $(kc_in): passphrase — sessync setup" "Нет $(kc_in): passphrase — sessync setup"
+    fi
     if [ "${2:-}" = --remote ] && load_env; then
       echo "$(t "In the storage" "В хранилище"): $(rclone size "$R" --fast-list 2>/dev/null | grep -i 'total size' | sed 's/.*: //')"
       rclone size ss:seg --fast-list --json 2>/dev/null | "$PY" -I -c '
@@ -1323,8 +1414,8 @@ print(("  из них дописанные части сессий (хвосты
   setup)
     if [ ! -t 0 ]; then say "Run it in your own terminal: it asks for input that must not reach a chat" \
       "Запустите в своём терминале: нужен ввод, который не должен попасть в чат"; exit 1; fi
-    command -v rclone >/dev/null || { say "Install first: ./install.sh or brew install rclone" "Сначала установите: ./install.sh (или brew install rclone)"; exit 1; }
-    if [ -z "$BUCKET$REMOTE" ] || [ "${2:-}" = --storage ]; then
+    command -v rclone >/dev/null || { say "Install first: ./install.sh or $(pkg_hint rclone)" "Сначала установите: ./install.sh (или $(pkg_hint rclone))"; exit 1; }
+    if ! storage_set || [ "${2:-}" = --storage ]; then
       setup_storage || { say "Storage not changed" "Хранилище не изменено"; exit 1; }
     fi
     if [ "$STORAGE" = s3 ]; then
@@ -1342,7 +1433,9 @@ print(("  из них дописанные части сессий (хвосты
       esac
       ask_secret s3-access-key "S3 Access Key" && ask_secret s3-secret-key "S3 Secret Key" || exit 1
     fi
-    if secret passphrase >/dev/null; then
+    if ! encrypted; then
+      say "No encryption (ENCRYPT=off): no password to set." "Без шифрования (ENCRYPT=off): пароль не нужен."
+    elif secret passphrase >/dev/null; then
       ask_secret passphrase "$(t "Encryption password" "Пароль шифрования")" || exit 1
     else
       say "The encryption password is one for all your Macs. If another Mac is set up already, enter the same." \
@@ -1351,17 +1444,18 @@ print(("  из них дописанные части сессий (хвосты
       read -rs p; echo
       if [ -z "$p" ]; then
         p=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32)
-        say "A new 32-character password was created and saved in the Keychain." "Создан новый пароль (32 символа) и сохранён в Связке ключей."
+        say "A new 32-character password was created and saved $(kc_in)." "Создан новый пароль (32 символа) и сохранён $(kc_in)."
         say "Save a copy for your other Macs: sessync export" "Сохраните его копию для других Mac: sessync export"
       elif [ ${#p} -lt 12 ]; then
         say "Too short (under 12 characters)" "Слишком короткий пароль (меньше 12 символов)"; exit 1
       fi
-      kc_set passphrase "$p" || { say "!! Could not save to the Keychain: passphrase" "!! Не удалось сохранить в Связку ключей: passphrase"; exit 1; }
+      kc_set passphrase "$p" || { say "!! Could not save $(kc_to): passphrase" "!! Не удалось сохранить $(kc_to): passphrase"; exit 1; }
       unset p
     fi
     if load_env && check_key; then
       rm -f "$st/error"
-      say "Done: the storage is reachable, the password matches." "Готово: доступ к хранилищу есть, пароль совпадает."
+      if encrypted; then say "Done: the storage is reachable, the password matches." "Готово: доступ к хранилищу есть, пароль совпадает."
+      else say "Done: the storage is reachable." "Готово: доступ к хранилищу есть."; fi
       if ! jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("sessync hook"))' "$cfg/settings.json" >/dev/null 2>&1; then
         read -rp "$(t "Add sessync hooks to ~/.claude/settings.json (sync at session start and end)? [Y/n] " \
           "Добавить хуки sessync в ~/.claude/settings.json (синхронизация при запуске и закрытии сессии)? [Y/n] ")" v
@@ -1375,8 +1469,18 @@ print(("  из них дописанные части сессий (хвосты
 
   export)
     if [ ! -t 0 ]; then say "Run it in your own terminal" "Запустите в своём терминале"; exit 1; fi
-    for a in passphrase $([ "$STORAGE" = s3 ] && echo s3-access-key s3-secret-key); do
-      secret "$a" >/dev/null || { say "Not in the Keychain: $a — run sessync setup first" "Нет в Связке ключей: $a — сначала sessync setup"; exit 1; }
+    if ! encrypted && [ "$STORAGE" != s3 ]; then
+      say "Nothing to export: no encryption password (ENCRYPT=off) and no storage keys." \
+        "Сохранять нечего: пароля шифрования нет (ENCRYPT=off), ключей хранилища тоже."
+      exit 0
+    fi
+    if [ "$OS" != Darwin ] && [ -z "$TEST_REMOTE" ]; then   # the walk-through is for the macOS Passwords app
+      say "On this system: secret-tool lookup service $KEYCHAIN_SERVICE account passphrase — and the same on the other machine with secret-tool store." \
+        "В этой системе: secret-tool lookup service $KEYCHAIN_SERVICE account passphrase — и на другой машине то же через secret-tool store."
+      exit 0
+    fi
+    for a in $(encrypted && echo passphrase) $([ "$STORAGE" = s3 ] && echo s3-access-key s3-secret-key); do
+      secret "$a" >/dev/null || { say "Not $(kc_in): $a — run sessync setup first" "Нет $(kc_in): $a — сначала sessync setup"; exit 1; }
     done
     if [ "$STORAGE" = rclone ]; then host=rclone.org
     elif [ -n "$ENDPOINT" ]; then host=${ENDPOINT#*://}; host=${host%%/*}

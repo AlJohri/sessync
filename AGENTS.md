@@ -54,7 +54,10 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    Under a new base, off-chain tails go too: the file only grows (shorter is always a conflict), so
    a tail starting inside the base can never attach again, and its data is with the Mac that sent
    it. Own off-chain tails are garbage only after the file was settled in this run.
-3. **Storage format.** crypt parameters and the layout — `v1/` (`projects/`, `history/`,
+3. **Storage format.** `ENCRYPT=off` (for `STORAGE=ssh` only through `setup`) keeps the same
+   layout with rclone `alias` remotes instead of crypt: the check file is `v1-check/keycheck`
+   instead of crypt's `keycheck.bin`, which is what makes `check_key` refuse a mix.
+   crypt parameters and the layout — `v1/` (`projects/`, `history/`,
    `seg/<tree>/<file path>/<tail>`, `trash/<date>/…` (`history/<id>/<Mac>.jsonl` — prompts of a
    forgotten session), `forgotten/<session id>`), `v1-check/keycheck`. The check file's first line
    (`cc-sync key check v1`, from the tool's old name) never changes; the second is the format
@@ -99,8 +102,11 @@ put that text into their `~/.claude/CLAUDE.md`. This file is about changing the 
    only in braces (`«${title}»`: bash 3.2 takes the bytes of `»` into the name). **python 3.9**
    (`/usr/bin/python3`): no `match`, no `X | Y` in types, no nanoseconds in `fromisoformat`;
    argparse values starting with `-` only as `--opt=value`.
-10. **macOS only for now**: Keychain, `osascript`, `scutil`, `ioreg`. Keep new code portable (no
-    `stat -f`, `date -j`), Linux is next.
+10. **macOS and Linux.** Platform calls branch on `OS` (`uname -s`): Keychain / `secret-tool`,
+    `osascript` / `notify-send`, the pasteboard / `wl-copy --sensitive`, `scutil`+`ioreg` /
+    `hostname`+`/etc/machine-id` (upper case, as IOPlatformUUID), `cp -c` / `cp --reflink=auto`.
+    Keep new code portable: no `stat -f`, `date -j`, `sed -i ''`, `pgrep -q` (procps has no `-q`:
+    `>/dev/null`). On Linux, tests use a file as the pasteboard (`SESSYNC_TEST_PASTEBOARD`).
 11. **The file of a session open on this Mac is not changed** (`opened`: sessync's own list
     `~/.local/state/sessync/open/<session id>` holding the pid of its `claude`, written by the hooks
     from their documented input; Claude Code's internal registry `~/.claude/sessions/`; `--open`). Claude Code reads a transcript when it opens it and then

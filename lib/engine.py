@@ -183,9 +183,12 @@ def mtime_of(s):
 
 
 def clone_prefix(src, dst, n):
-    """The first n bytes of src into dst: on APFS an instant clone, no copying and no extra space."""
+    """The first n bytes of src into dst: on APFS, btrfs or XFS an instant clone, no copying and no extra
+    space. GNU cp's -c is --preserve=context, so elsewhere it is --reflink=auto (a plain copy where
+    the file system has no clones)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
+    clone = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto"]
+    if subprocess.run(clone + [src, dst], capture_output=True).returncode != 0:
         shutil.copyfile(src, dst)
     if os.path.getsize(dst) < n:
         raise Fail(tx("the file got shorter during the sync: ", "файл стал короче во время синхронизации: ") + src)

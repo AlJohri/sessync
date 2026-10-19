@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (fork: linux-ssh)
+
+- Linux: secrets in the Secret Service keyring (`secret-tool`), notifications through `notify-send`,
+  the clipboard of `sessync export` through `wl-copy --sensitive`, the machine id from
+  `/etc/machine-id`, instant copies with `cp --reflink=auto` on btrfs and XFS. `install.sh` runs on
+  Linux and names missing packages instead of installing them.
+- Fix: the background loop ended after its first wait on Linux: procps `pgrep` has no `-q`.
+- `STORAGE=ssh` (`sessync setup`, option 6): a folder on a machine of your own, reached with
+  `ssh SSH_HOST` (your ssh config, keys and agent; one connection shared per run). The machine that
+  holds it uses the folder directly.
+- `ENCRYPT=off`, offered only for `STORAGE=ssh`: the storage keeps the files as they are and no
+  password is needed. A storage written with encryption and one without refuse each other.
+- The background sync runs every 5 minutes instead of 10 (`INTERVAL`, seconds).
+- Tests run on Linux too.
+
 ## 3.0.2 — 2026-10-15
 
 - A background session (`claude --bg`) is kept open under its own process, not the shared `claude daemon`:

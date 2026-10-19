@@ -70,6 +70,18 @@ Give sessync a key limited to one private bucket used only for sessions — not 
 key, which opens all your buckets. With an rclone remote (Google Drive, Dropbox…), sessync uses the
 access you configured in `rclone config`; the data is still encrypted by sessync.
 
+## Storage of your own, without encryption
+
+`ENCRYPT=off` (only offered for `STORAGE=ssh`, a folder on a machine of your own) turns all of the
+above off for the storage: sessions, their names and the prompt history lie there in plain text,
+readable by anyone who can read that folder or that machine's backups. Use it only when the
+storage machine is as trusted as the ones that sync with it. Mixing is refused: a machine with
+encryption on finds no check file it can decrypt, and one with it off finds `keycheck.bin`
+instead of `keycheck`, so neither writes.
+
+On Linux, secrets (when there are any) go to the Secret Service keyring through `secret-tool`,
+given on stdin, not in a command line.
+
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting: the **Security** tab of this repository →

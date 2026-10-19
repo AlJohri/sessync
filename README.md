@@ -18,7 +18,7 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 
 ## What you get
 
-- **Automatic.** sessync syncs when `claude` starts and exits, and every 10 minutes while at least
+- **Automatic.** sessync syncs when `claude` starts and exits, and every 5 minutes while at least
   one `claude` is open. When the last one closes, nothing is left running: no launchd services, no
   login items.
 - **Resume on any Mac.** `claude -r <id>` and `/resume` see the sessions started on your other Macs.
@@ -56,11 +56,12 @@ they ran, and deletes them after 30 days by default. It has no sync between comp
 | Encryption | contents and file names | contents | none (encrypt the repo yourself) | on the provider's side |
 | Runs | automatically (Claude Code hooks) | by hand: `push` / `pull` | by hand or from cron | automatically |
 | Search | `sessync find` | — | — | — |
-| Platforms | macOS (Linux next) | macOS, Linux, Windows | macOS, Linux, Windows | all |
+| Platforms | macOS, Linux | macOS, Linux, Windows | macOS, Linux, Windows | all |
 
 ## Requirements
 
-- macOS, [Homebrew](https://brew.sh) and the Claude Code CLI.
+- macOS with [Homebrew](https://brew.sh), or Linux with rclone, ripgrep, jq and python3 from its
+  package manager. And the Claude Code CLI.
 - Storage: a private bucket or any rclone remote. Cloudflare R2's free tier (10 GB, free downloads)
   is enough for years of sessions.
 
@@ -111,6 +112,28 @@ clears the clipboard at the end. The Passwords entry reaches your other devices 
    Passwords entry). With another password sessync refuses to work and writes nothing to the
    storage.
 3. `sessync` — downloads all sessions.
+
+### Linux, and storage on a machine of your own
+
+On Linux, install rclone, ripgrep and jq with the package manager, then run `install.sh` from git
+(there is no Homebrew formula). Secrets go to the Secret Service keyring (`secret-tool`),
+notifications to `notify-send`.
+
+`sessync setup` option 6 keeps the storage in a folder on a machine of your own, over ssh: one
+machine holds the folder, and the others reach it with `ssh <host>` — your ssh config, keys and
+agent, so a Tailscale name works. The machine that holds it uses the folder directly. ssh must work
+without a password prompt. The same in the config (`~/.config/sessync/config`):
+
+```
+STORAGE=ssh
+SSH_HOST=framework16      # as you reach it with ssh; on that machine itself — its own name
+SSH_PATH=sessync          # from its home folder, or an absolute path
+ENCRYPT=off               # only for storage of your own: no password, the files as they are
+```
+
+With `ENCRYPT=off` the storage holds the sessions in plain text and no password is asked for.
+Every machine on one storage must agree: sessync refuses to work if one encrypts and another
+doesn't. Option 6 asks whether to encrypt; every other storage is always encrypted.
 
 ## Usage
 
@@ -267,8 +290,9 @@ in [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- macOS only for now. Linux is next.
-- Sync is not instant: when a session starts and ends, and every 10 minutes. Run `sessync` before
+- macOS and Linux.
+- Sync is not instant: when a session starts and ends, and every 5 minutes (`INTERVAL` in the
+  config, in seconds). Run `sessync` before
   switching to another Mac.
 - Continuing one session on two Macs at the same time splits it into two sessions. Nothing is lost,
   but the conversation ends up in two places.

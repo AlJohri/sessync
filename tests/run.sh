@@ -51,6 +51,9 @@ say() {  # say A project id text — append a conversation line to a session
 lines() { wc -l < "$1" | tr -d ' '; }
 contains() { grep -qF -- "$2" "$1"; }
 absent() { ! grep -rqF -- "$2" "$1"; }
+# stat в BSD и GNU разный: inode и права
+if [ "$(uname)" = Darwin ]; then inode() { stat -f %i "$1"; }; perm() { stat -f %Lp "$1"; }
+else inode() { stat -c %i "$1"; }; perm() { stat -c %a "$1"; }; fi
 
 echo "== Первый Mac загружает, второй получает"
 mac A; mac B
@@ -189,7 +192,7 @@ for i in $(seq 1 200); do say P -tmp-p4 long "строка $i $pad"; done
 run P now >/dev/null; run Q now >/dev/null
 check "Q получил сессию байт в байт" same P Q $L
 check "в хранилище пока только основа, без хвостов" test "$(nsegs P)" = 0
-ino=$(stat -f %i "$T/Q/projects/$L")
+ino=$(inode "$T/Q/projects/$L")
 say P -tmp-p4 long "дописано на P"
 run P now >/dev/null
 check "дописанное ушло одним хвостом" test "$(nsegs P)" = 1
@@ -197,7 +200,7 @@ check "в хвосте — только дописанная строка" test 
 check "в журнале — килобайты, а не вся сессия" sh -c "printf '%s' \"\$1\" | grep -q 'отправлено 1 (1 КБ), получено 0 (0 КБ)'" _ "$(uplog P)"
 run Q now >/dev/null
 check "Q дописал хвост к своему файлу" same P Q $L
-check "Q: тот же файл, а не замена целиком" test "$(stat -f %i "$T/Q/projects/$L")" = "$ino"
+check "Q: тот же файл, а не замена целиком" test "$(inode "$T/Q/projects/$L")" = "$ino"
 check "без изменений: ничего не передаётся" has Q 'отправлено файлов 0, получено 0' now
 
 for i in 1 2 3; do say P -tmp-p4 long "ещё $i"; run P now >/dev/null; done
@@ -315,7 +318,7 @@ meta() {  # meta A project id — одни служебные строки Claud
     "$3" "$3" >> "$T/$1/projects/$2/$3.jsonl"
 }
 others() { ls "$T/$1/projects/$2" | grep '\.jsonl$' | grep -vx "$3.jsonl"; }   # другие сессии проекта
-waitrun() { local i; for i in $(seq 1 150); do pgrep -qf 'bin/sessync _run' || return 0; sleep 0.2; done; }
+waitrun() { local i; for i in $(seq 1 150); do pgrep -f 'bin/sessync _run' >/dev/null || return 0; sleep 0.2; done; }
 S1=11111111-1111-4111-8111-111111111111
 k=$T/K1/projects/-tmp-k
 say K1 -tmp-k $S1 "общее начало"
@@ -412,7 +415,7 @@ check "имя другого Mac — из его истории промптов
 echo RESUME_CHECK=off >> "$T/K1/config/sessync/config"
 resume K1 $S4 -tmp-k4
 check "RESUME_CHECK=off: без проверки и ожидания" test ! -s "$T/hook.out"
-sed -i '' '/RESUME_CHECK/d' "$T/K1/config/sessync/config"
+sed -i.bak '/RESUME_CHECK/d' "$T/K1/config/sessync/config" && rm -f "$T/K1/config/sessync/config.bak"
 run K1 now >/dev/null
 say K2 -tmp-k4 $S4 "ещё с K2, пока на K1 сессия закрывается"
 run K2 now >/dev/null
@@ -732,6 +735,31 @@ check "X: получил сессию" contains "$T/X/projects/-tmp-rc/r1.jsonl"
 check "в хранилище rclone — шифротекст" absent "$T/rclone-remote" "через rclone"
 check "status называет хранилище rclone" has X 'rclone' status
 
+echo "== Хранилище по ssh на своей машине, без шифрования (ENCRYPT=off)"
+# SSH_HOST — сама эта машина: папка напрямую, без ssh
+for m in N1 N2; do mac $m; printf 'STORAGE=ssh\nSSH_HOST=localhost\nSSH_PATH=%s\nENCRYPT=off\n' "$T/ssh-store" > "$T/$m/config/sessync/config"; done
+nopw() { SESSYNC_TEST_PASSPHRASE= ss "$@"; }   # пароля нет нигде
+say N1 -tmp-pl p1 "открытым текстом"
+check "N1: синхронизация без пароля" nopw N1 now
+nopw N2 now >/dev/null
+check "N2: получил сессию" contains "$T/N2/projects/-tmp-pl/p1.jsonl" "открытым текстом"
+check "в хранилище — открытый текст" grep -rqF "открытым текстом" "$T/ssh-store/v1"
+check "в хранилище — открытые имена" test -d "$T/ssh-store/v1/projects/-tmp-pl"
+say N2 -tmp-pl p1 "дописано на N2"
+nopw N2 now >/dev/null; nopw N1 now >/dev/null
+check "N1: дописанное на N2 пришло" contains "$T/N1/projects/-tmp-pl/p1.jsonl" "дописано на N2"
+check "status: без шифрования" has N2 'без шифрования' status
+check "status: раз в 5 мин по умолчанию" has N2 'раз в 5 мин' status
+nopass() { ! nopw N2 status 2>&1 | grep -q passphrase; }
+check "status не просит пароль" nopass
+mac N3; printf 'STORAGE=ssh\nSSH_HOST=localhost\nSSH_PATH=%s\n' "$T/ssh-store" > "$T/N3/config/sessync/config"
+check "с шифрованием на хранилище без шифрования — отказ" not run N3 now
+check "отказ называет ENCRYPT" contains "$(stf N3 error)" ENCRYPT
+check "хранилище без шифрования не тронуто" test ! -e "$T/ssh-store/v1-check/keycheck.bin"
+mac N4; echo ENCRYPT=off >> "$T/N4/config/sessync/config"   # общее зашифрованное хранилище A, B…
+check "без шифрования на зашифрованном хранилище — отказ" not nopw N4 now
+check "в зашифрованное хранилище ничего не записано открытым текстом" test ! -e "$T/s3/bucket/v1-check/keycheck"
+
 echo "== Ничего не пишется за пределы папки проектов"
 mkdir -p "$T/s3/bucket8" "$T/outside"
 for m in Y Z; do mac $m; setconf $m bucket8; done
@@ -782,7 +810,8 @@ printf '{"cleanupPeriodDays": 30}\n' > "$T/dotfiles/settings.json"; chmod 644 "$
 ln -s "$T/dotfiles/settings.json" "$T/H/settings.json"
 run H now >/dev/null
 check "срок хранения: settings.json-ссылка осталась ссылкой" test -L "$T/H/settings.json"
-check "срок хранения: записан в файл по ссылке, права прежние" sh -c "jq -e '.cleanupPeriodDays == 36500' '$T/dotfiles/settings.json' && test \"\$(stat -f %Lp '$T/dotfiles/settings.json')\" = 644"
+check "срок хранения: записан в файл по ссылке, права прежние" sh -c "jq -e '.cleanupPeriodDays == 36500' '$T/dotfiles/settings.json' && test '$(perm "$T/dotfiles/settings.json")' = 644"
+if [ "$(uname)" = Darwin ]; then
 pb="sessync-test-$$"
 pbread() { osascript -l JavaScript -e "ObjC.import('AppKit'); var pb = \$.NSPasteboard.pasteboardWithName('$pb'); JSON.stringify([ObjC.deepUnwrap(pb.types), ObjC.unwrap(pb.stringForType('public.utf8-plain-text'))])"; }
 printf 'секрет "в кавычках"' | SESSYNC_TEST_PASTEBOARD="$pb" src clip
@@ -794,6 +823,13 @@ printf '' | SESSYNC_TEST_PASTEBOARD="$pb" src clip
 out=$(pbread)
 check "export: пустой ввод очищает буфер" sh -c "! grep -q секрет" <<<"$out"
 osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSPasteboard.pasteboardWithName('$pb').releaseGlobally" >/dev/null 2>&1
+else   # Linux: тестовый буфер — файл, настоящий буфер (wl-copy) не трогается
+pb="$T/pb-clip"
+printf 'секрет "в кавычках"' | SESSYNC_TEST_PASTEBOARD="$pb" src clip
+check "export: значение в буфере как есть" test "$(cat "$pb")" = 'секрет "в кавычках"'
+printf '' | SESSYNC_TEST_PASTEBOARD="$pb" src clip
+check "export: пустой ввод очищает буфер" test ! -s "$pb"
+fi
 
 echo "== sessync setup: хранилище, ключи и пароль — в терминале, как у человека"
 PYT=${SESSYNC_PYTHON:-python3}
@@ -817,7 +853,7 @@ check "без терминала: отказ" not sm M1 setup </dev/null
 check "без терминала: просит свой терминал" smhas M1 'в своём терминале' setup </dev/null
 mkdir -p "$T/s3/b-r2" "$T/M1/projects"   # бакет пользователь создаёт сам
 check "первый Mac: Cloudflare R2, новый пароль, hook'и" tsm M1 setup \
-  --expect 'Выбор [1-5]:' --send 1 --expect 'ID аккаунта Cloudflare' --send acc123 \
+  --expect 'Выбор [1-6]:' --send 1 --expect 'ID аккаунта Cloudflare' --send acc123 \
   --expect 'Имя бакета:' --send b-r2 \
   --expect 'S3 Access Key:' --secret AKR2TEST --expect 'S3 Secret Key:' --secret SKR2TEST-secret \
   --expect 'Enter — создать новый' --secret '' --expect '[Y/n]' --send '' --expect 'Первая синхронизация'
@@ -834,7 +870,7 @@ check "после setup синхронизация работает" sm M1 now
 
 mkdir -p "$T/M2/projects"; printf '{"cleanupPeriodDays": 36500}\n' > "$T/M2/settings.json"
 check "второй Mac с другим паролем: проверка не проходит" not tsm M2 setup \
-  --expect 'Выбор [1-5]:' --send 1 --expect 'ID аккаунта' --send acc123 --expect 'Имя бакета:' --send b-r2 \
+  --expect 'Выбор [1-6]:' --send 1 --expect 'ID аккаунта' --send acc123 --expect 'Имя бакета:' --send b-r2 \
   --expect 'S3 Access Key:' --secret AKR2TEST --expect 'S3 Secret Key:' --secret SKR2TEST-secret \
   --expect 'Enter — создать новый' --secret wrong-password-12345 --expect 'Проверка не прошла'
 check "второй Mac: причина — пароль не тот" shown M2 'пароль шифрования не тот'
@@ -842,17 +878,17 @@ check "второй Mac: повторный setup — без выбора хра
   --expect 'S3 Access Key уже есть' --secret '' --expect 'S3 Secret Key уже есть' --secret '' \
   --expect 'Пароль шифрования уже есть' --secret "$(kc M1 passphrase)" --expect 'Готово:' \
   --expect '[Y/n]' --send n --expect 'Первая синхронизация'
-check "второй Mac: меню хранилища не показывалось" not shown M2 'Выбор [1-5]'
+check "второй Mac: меню хранилища не показывалось" not shown M2 'Выбор [1-6]'
 check "второй Mac: ключи прежние" test "$(kc M2 s3-access-key)" = AKR2TEST
 check "второй Mac: от hook'ов отказались — их нет" not jq -e '.hooks' "$T/M2/settings.json"
 check "второй Mac: сессии первого пришли" sh -c "$(declare -f sm); T='$T' here='$here'; sm M2 now && test -f '$T/M2/projects/-tmp-st/st1.jsonl'"
 check "setup --storage, неверный выбор: хранилище не изменено" not tsm M1 'setup --storage' \
-  --expect 'Выбор [1-5]:' --send 9 --expect 'не изменено'
+  --expect 'Выбор [1-6]:' --send 9 --expect 'не изменено'
 check "и настройки прежние" conf M1 BUCKET=b-r2
 
 mkdir -p "$T/s3/b-b2" "$T/M3/projects"
 check "короткий пароль: отказ" not tsm M3 setup \
-  --expect 'Выбор [1-5]:' --send 2 --expect 'Регион B2' --send us-west-004 --expect 'Имя бакета:' --send b-b2 \
+  --expect 'Выбор [1-6]:' --send 2 --expect 'Регион B2' --send us-west-004 --expect 'Имя бакета:' --send b-b2 \
   --expect 'S3 Access Key:' --secret K --expect 'S3 Secret Key:' --secret S \
   --expect 'Enter — создать новый' --secret short --expect 'Слишком короткий'
 check "короткий пароль не сохранён" test ! -e "$T/M3/keychain/passphrase"
@@ -862,7 +898,7 @@ check "B2: подсказка про Application Keys" shown M3 'Application Key
 
 mkdir -p "$T/s3/b-aws" "$T/M4/projects"
 check "Amazon S3" tsm M4 setup \
-  --expect 'Выбор [1-5]:' --send 3 --expect 'Регион AWS' --send eu-central-1 --expect 'Имя бакета:' --send b-aws \
+  --expect 'Выбор [1-6]:' --send 3 --expect 'Регион AWS' --send eu-central-1 --expect 'Имя бакета:' --send b-aws \
   --expect 'S3 Access Key:' --secret AKAWS --expect 'S3 Secret Key:' --secret SKAWS \
   --expect 'Enter — создать новый' --secret aws-password-123456 --expect '[Y/n]' --send n --expect 'Первая синхронизация'
 check "AWS: без адреса, с регионом" sh -c "$(declare -f conf); T='$T'; conf M4 ENDPOINT= && conf M4 REGION=eu-central-1 && conf M4 PROVIDER=AWS"
@@ -872,7 +908,7 @@ check "AWS: status называет регион" smhas M4 'b-aws (AWS eu-centra
 mkdir -p "$T/s3/b-other" "$T/M5/config/sessync"
 printf 'TRASH_DAYS=7\nINTERVAL=300\n' > "$T/M5/config/sessync/config"
 check "другое S3-хранилище, регион пустой" tsm M5 setup \
-  --expect 'Выбор [1-5]:' --send 4 --expect 'Адрес (endpoint' --send https://s3.example.net \
+  --expect 'Выбор [1-6]:' --send 4 --expect 'Адрес (endpoint' --send https://s3.example.net \
   --expect 'Регион (Enter' --send '' --expect 'Имя бакета:' --send b-other \
   --expect 'S3 Access Key:' --secret AKO --expect 'S3 Secret Key:' --secret SKO \
   --expect 'Enter — создать новый' --secret '' --expect '[Y/n]' --send n --expect 'Первая синхронизация'
@@ -882,9 +918,9 @@ check "прочие строки настроек остались" sh -c "$(dec
 
 mkdir -p "$T/M6/projects"
 check "rclone: без двоеточия — отказ" not tsm M6 setup \
-  --expect 'Выбор [1-5]:' --send 5 --expect 'Хранилище и папка' --send gdrive --expect 'не изменено'
+  --expect 'Выбор [1-6]:' --send 5 --expect 'Хранилище и папка' --send gdrive --expect 'не изменено'
 check "rclone: хранилище с папкой" tsm M6 setup \
-  --expect 'Выбор [1-5]:' --send 5 --expect 'Хранилище и папка' --send ":local:$T/rc-setup/sessync" \
+  --expect 'Выбор [1-6]:' --send 5 --expect 'Хранилище и папка' --send ":local:$T/rc-setup/sessync" \
   --expect 'Enter — создать новый' --secret '' --expect '[Y/n]' --send n --expect 'Первая синхронизация'
 check "rclone: настройки" sh -c "$(declare -f conf); T='$T'; conf M6 STORAGE=rclone && conf M6 'REMOTE=:local:$T/rc-setup/sessync' && conf M6 BUCKET="
 check "rclone: ключи S3 не спрашивались" not shown M6 'S3 Access Key'
@@ -894,8 +930,10 @@ check "rclone: синхронизация работает" sm M6 now
 
 echo "== sessync export: ключи и пароль по одному через буфер обмена (тестовый, не общий)"
 pbx="sessync-test-export-$$"
+[ "$(uname)" = Darwin ] || pbx="$T/pb-export"   # Linux: файл вместо именованного буфера
 cat > "$T/pbget" <<'EOF'
 #!/bin/sh
+[ "$(uname)" = Darwin ] || exec cat "$1" 2>/dev/null
 exec osascript -l JavaScript -e 'function run(a) { ObjC.import("AppKit"); return ObjC.unwrap($.NSPasteboard.pasteboardWithName(a[0]).stringForType("public.utf8-plain-text")) || "" }' "$1"
 EOF
 chmod +x "$T/pbget"
@@ -927,7 +965,7 @@ check "AWS: адрес для «Паролей» — s3.amazonaws.com" tsm M4 ex
   --expect 'адрес хранилища: s3.amazonaws.com' --send '' --expect 'Шаг 2 из 4' --send '' \
   --expect 'Шаг 3 из 4' --send '' --expect 'Шаг 4 из 4' --send '' --expect 'буфер обмена очищен'
 unset SESSYNC_TEST_PASTEBOARD
-osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSPasteboard.pasteboardWithName('$pbx').releaseGlobally" >/dev/null 2>&1
+[ "$(uname)" = Darwin ] && osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSPasteboard.pasteboardWithName('$pbx').releaseGlobally" >/dev/null 2>&1
 
 echo "== Поиск"
 check "find находит по переписке" sh -c "$(declare -f ss); T='$T' here='$here'; ss B find уникальнаяфраза | grep -q 'claude -r s5'"
@@ -939,7 +977,6 @@ check "find находит сессию с управляющими символ
 check "find не выводит ESC, BEL и bidi" sh -c "! printf '%s' \"\$1\" | LC_ALL=C grep -q \$'[\\x1b\\x07]\\|\\xe2\\x80\\xae'" _ "$out"
 
 echo "== Права файлов: только владелец, как у транскриптов Claude Code"
-perm() { stat -f %Lp "$1"; }
 check "индекс поиска — 700" test "$(perm "$T/A/cache/sessync/find")" = 700
 check "файлы индекса — 600" test "$(perm "$(find "$T/A/cache/sessync/find/text" -type f | head -1)")" = 600
 check "состояние sessync — 700" test "$(perm "$T/B/state/sessync")" = 700
