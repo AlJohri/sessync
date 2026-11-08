@@ -662,6 +662,20 @@ check "сессия остановлена, демон жив — forget уда�
 check "и файла нет" test ! -e "$f9/$G11.jsonl"
 kill $dpid $hpid $ipid; wait $dpid $hpid $ipid 2>/dev/null
 
+# claude из nixpkgs: makeWrapper запускает бинарник под именем .claude-wrapped
+G13=edededed-1313-4013-8013-131313131313
+say FA -tmp-f $G13 "claude из nix"
+sleep 60 & wpid=$!
+printf '%s\t%s\t%s\t%s\n' $wpid 1 ".claude-wrapped" "claude --resume" > "$procs"
+SESSYNC_TEST_PROCS=$procs SESSYNC_TEST_PPID=$wpid resume FA $G13 -tmp-f startup
+check "nix: в списке открытых pid .claude-wrapped" test "$(cat "$(stf FA open)/$G13")" = $wpid
+kill $wpid; wait $wpid 2>/dev/null
+# Копия bash, а не ссылка на sleep: coreutils бывает одним бинарником, выбирающим команду по argv[0]
+mkdir -p "$T/nixbin"; cp "$(command -v bash)" "$T/nixbin/.claude-wrapped"
+"$T/nixbin/.claude-wrapped" -c 'sleep 60; :' & wpid=$!
+check "nix: фоновый цикл видит .claude-wrapped" bash -c "source '$here/bin/sessync' version >/dev/null; pgrep -x \"\$CLAUDE_COMM\" | grep -qx $wpid"
+kill $wpid; wait $wpid 2>/dev/null
+
 say FA -tmp-f $G6 "начало G6"
 run FA now >/dev/null; run FB now >/dev/null
 say FB -tmp-f $G6 "FB дописал, ещё не зная"

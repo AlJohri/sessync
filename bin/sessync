@@ -12,6 +12,8 @@ VERSION=3.0.2
 # Everything sessync creates (downloaded sessions, other Macs' prompts, the log) is owner-only,
 # like Claude Code's own transcripts
 umask 077
+# Process names of a claude: nixpkgs' makeWrapper runs the binary as .claude-wrapped
+CLAUDE_COMM='claude|\.claude-wrapped'
 
 cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"                       # Claude Code data
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/sessync/config"          # storage settings, no secrets
@@ -806,7 +808,7 @@ proc_kind() {
   case ${c##*/} in
     "claude bg-spare"*) echo session ;;
     "claude "*) echo service ;;
-    claude|[0-9]*.[0-9]*.[0-9]*)
+    claude|.claude-wrapped|[0-9]*.[0-9]*.[0-9]*)
       if [ "$(proc "$1" args | awk '{ print $2 }')" = daemon ]; then echo service; else echo session; fi ;;
   esac
 }
@@ -1228,7 +1230,7 @@ case "${1:-now}" in
     echo $$ > "$st/loop.pid"
     while sleep "$INTERVAL"; do
       [ -f "$st/off" ] && break
-      pgrep -x claude >/dev/null || break   # the last session closed — the loop ends by itself (procps has no -q)
+      pgrep -x "$CLAUDE_COMM" >/dev/null || break   # the last session closed — the loop ends by itself (procps has no -q)
       "$self" _run
     done
     rm -f "$st/loop.pid" ;;

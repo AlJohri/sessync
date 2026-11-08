@@ -7,6 +7,8 @@
   `/etc/machine-id`, instant copies with `cp --reflink=auto` on btrfs and XFS. `install.sh` runs on
   Linux and names missing packages instead of installing them.
 - Fix: the background loop ended after its first wait on Linux: procps `pgrep` has no `-q`.
+- Fix: a claude from nixpkgs runs as `.claude-wrapped`. The background loop took it for no claude
+  and ended after its first wait, and the hooks did not keep its session in the list of open ones.
 - `STORAGE=ssh` (`sessync setup`, option 6): a folder on a machine of your own, reached with
   `ssh SSH_HOST` (your ssh config, keys and agent; one connection shared per run). The machine that
   holds it uses the folder directly.
